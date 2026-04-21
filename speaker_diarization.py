@@ -185,6 +185,32 @@ def _cluster_features(X, n_speakers, AgglomerativeClustering):
     return model.fit_predict(X)
 
 
+def _estimate_speaker_count(X, AgglomerativeClustering, silhouette_score, max_speakers=6):
+    sample_count = int(X.shape[0])
+    if sample_count < 2:
+        return 1
+    if sample_count == 2:
+        return 2
+
+    upper_bound = max(2, min(int(max_speakers), sample_count - 1))
+    best_count = 2
+    best_score = float("-inf")
+
+    for cluster_count in range(2, upper_bound + 1):
+        try:
+            labels = AgglomerativeClustering(n_clusters=cluster_count, linkage="ward").fit_predict(X)
+            if len(set(labels)) < 2:
+                continue
+            score = float(silhouette_score(X, labels))
+            if score > best_score:
+                best_score = score
+                best_count = cluster_count
+        except Exception:
+            continue
+
+    return best_count
+
+
 def _assign_missing_labels(speakers, valid_idx, segments):
     if not valid_idx:
         return speakers
@@ -283,6 +309,7 @@ def diarize_segments(audio_path, segments, n_speakers=2):
     try:
         import librosa
         from sklearn.cluster import AgglomerativeClustering
+        from sklearn.metrics import silhouette_score
         from sklearn.preprocessing import StandardScaler
     except Exception as exc:
         print(f"Diarization dependency issue: {exc}")
@@ -309,8 +336,21 @@ def diarize_segments(audio_path, segments, n_speakers=2):
     X = np.stack(features, axis=0)
     X = _normalize_features(X, StandardScaler)
 
+    target_speakers = n_speakers
+    if target_speakers in (None, "", 0, "0", "auto"):
+        target_speakers = _estimate_speaker_count(
+            X,
+            AgglomerativeClustering=AgglomerativeClustering,
+            silhouette_score=silhouette_score,
+            max_speakers=6,
+        )
+
     try:
-        labels = _cluster_features(X, n_speakers=n_speakers, AgglomerativeClustering=AgglomerativeClustering)
+        labels = _cluster_features(
+            X,
+            n_speakers=target_speakers,
+            AgglomerativeClustering=AgglomerativeClustering,
+        )
     except Exception as exc:
         print(f"Diarization clustering error: {exc}")
         return _turn_taking_speakers(segments)

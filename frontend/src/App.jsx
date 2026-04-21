@@ -1,4 +1,5 @@
 import { useEffect, useMemo, useState } from "react";
+import LiveMode from "./LiveMode";
 
 const API_BASE = import.meta.env.VITE_API_BASE_URL || "http://127.0.0.1:8000";
 const LANGUAGE_OPTIONS = [
@@ -33,6 +34,7 @@ const tabs = [
   { id: "simplified", label: "Simplified View" },
   { id: "voice", label: "Voice + Translation" },
   { id: "notes", label: "Meeting Notes" },
+  { id: "live", label: "🔴 Live Mode" },
 ];
 
 const initialResult = {
@@ -61,7 +63,8 @@ const initialResult = {
 function App() {
   const [geminiConfigured, setGeminiConfigured] = useState(false);
   const [openRouterConfigured, setOpenRouterConfigured] = useState(false);
-  const [speakerCount, setSpeakerCount] = useState(2);
+  const [liveModeAvailable, setLiveModeAvailable] = useState(false);
+  const [speakerCount, setSpeakerCount] = useState("auto");
   const [selectedTab, setSelectedTab] = useState("transcript");
   const [videoFile, setVideoFile] = useState(null);
   const [status, setStatus] = useState("Waiting for input.");
@@ -100,12 +103,14 @@ function App() {
       .then((payload) => {
         setGeminiConfigured(Boolean(payload.geminiConfigured));
         setOpenRouterConfigured(Boolean(payload.openRouterConfigured));
+        setLiveModeAvailable(Boolean(payload.liveModeAvailable));
         if (payload.defaultLanguage) setTranscriptionLanguage(payload.defaultLanguage);
         if (payload.defaultDomainMode) setDomainMode(payload.defaultDomainMode);
       })
       .catch(() => {
         setGeminiConfigured(false);
         setOpenRouterConfigured(false);
+        setLiveModeAvailable(false);
       });
   }, []);
 
@@ -595,15 +600,15 @@ function App() {
 
             <label className="field">
               <span>Expected speaker count</span>
-              <input
-                type="range"
-                min="1"
-                max="6"
-                step="1"
-                value={speakerCount}
-                onChange={(event) => setSpeakerCount(Number(event.target.value))}
-              />
-              <strong>{speakerCount}</strong>
+              <select value={speakerCount} onChange={(event) => setSpeakerCount(event.target.value)}>
+                <option value="auto">Auto Detect</option>
+                <option value="1">1 speaker</option>
+                <option value="2">2 speakers</option>
+                <option value="3">3 speakers</option>
+                <option value="4">4 speakers</option>
+                <option value="5">5 speakers</option>
+                <option value="6">6 speakers</option>
+              </select>
             </label>
 
             <label className="field">
@@ -765,8 +770,8 @@ function App() {
         <section className="panel main-panel">
           <div className="section-heading">Workspace</div>
           <p className="section-copy">
-            Review the transcript, compare stages, rename speakers, search timestamps, generate notes, and export
-            the final result from one place.
+            Review the transcript, compare stages, rename speakers, search timestamps, generate notes, run live
+            transcription, and export the final result from one place.
           </p>
 
           <div className="tabs">
@@ -987,6 +992,8 @@ function App() {
               </div>
             </div>
           )}
+
+          {selectedTab === "live" && <LiveMode apiBase={API_BASE} isAvailable={liveModeAvailable} />}
         </section>
       </main>
     </div>

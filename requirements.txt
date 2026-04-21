@@ -13,3 +13,4 @@ imageio-ffmpeg
 fastapi
 uvicorn
 python-multipart
+sounddevice

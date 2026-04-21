@@ -451,6 +451,10 @@ textarea {
   min-height: 320px;
 }
 
+.text-panel textarea[readonly] {
+  cursor: default;
+}
+
 .info-panel,
 .audio-card {
   padding: 14px;

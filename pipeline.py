@@ -82,7 +82,7 @@ def run_transcription_pipeline(
         meta={
             "transcriptionLanguage": transcription_language or "auto",
             "domainMode": domain_mode or "meeting",
-            "speakerCount": int(speaker_count),
+            "speakerCount": 0 if str(speaker_count).strip().lower() == "auto" else int(speaker_count),
             "feedbackAttempts": correction_loop.meta.get("attempts", 0),
             "feedbackHistory": correction_loop.meta.get("feedback_history", []),
         },
@@ -109,7 +109,10 @@ def _transcription_stage(audio_path, transcription_language="auto") -> StageResu
 
 def _diarization_stage(audio_path, segments, speaker_count) -> StageResult:
     try:
-        speaker_segments = diarize_segments(audio_path, segments, n_speakers=int(speaker_count))
+        normalized_speaker_count = speaker_count
+        if str(speaker_count).strip().lower() != "auto":
+            normalized_speaker_count = int(speaker_count)
+        speaker_segments = diarize_segments(audio_path, segments, n_speakers=normalized_speaker_count)
         speaker_transcript = format_diarized_transcript(speaker_segments)
         timestamped_transcript = _format_timestamped_transcript(speaker_segments)
         serializable_segments = [_serialize_segment(segment) for segment in speaker_segments]

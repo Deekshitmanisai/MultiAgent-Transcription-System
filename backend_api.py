@@ -8,7 +8,6 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 from pydantic import BaseModel, Field
 
-from correction_agent import correct_text
 from config import (
     DEFAULT_DOMAIN_MODE,
     DEFAULT_TRANSCRIPTION_LANGUAGE,
@@ -21,10 +20,12 @@ from config import (
 )
 from mom_agent import generate_minutes_of_meeting
 from pipeline import run_transcription_pipeline
+from pipeline_controller import run_feedback_correction_loop
 from simplification_agent import simplify_transcript
 from translation_agent import LANGUAGE_SPECS, translate_text
 from tts_agent import text_to_speech_file
 from validation_agent import validate_transcript_detailed
+from websocket import register_live_routes
 
 
 TEMP_DIR.mkdir(exist_ok=True)
@@ -83,6 +84,13 @@ def _serialize_validation(result):
 
 @app.get("/api/health")
 def health():
+    try:
+        import sounddevice  # noqa: F401
+
+        live_mode_available = True
+    except Exception:
+        live_mode_available = False
+
     return {
         "ok": True,
         "service": "adaptive-hybrid-ai-transcription-system",
@@ -92,13 +100,14 @@ def health():
         "openRouterValidationModel": OPENROUTER_VALIDATION_MODEL,
         "defaultLanguage": DEFAULT_TRANSCRIPTION_LANGUAGE,
         "defaultDomainMode": DEFAULT_DOMAIN_MODE,
+        "liveModeAvailable": live_mode_available,
     }
 
 
 @app.post("/api/process")
 async def process(
     file: UploadFile = File(...),
-    speaker_count: int = Form(2),
+    speaker_count: str = Form("auto"),
     transcription_language: str = Form(DEFAULT_TRANSCRIPTION_LANGUAGE),
     domain_mode: str = Form(DEFAULT_DOMAIN_MODE),
 ):
@@ -190,12 +199,18 @@ def refine(payload: RefineRequest):
             detail="Gemini is not configured on the backend. Set GEMINI_API_KEY and restart the backend.",
         )
 
-    feedback = {
-        "issues": payload.issues or [],
-        "suggestions": payload.suggestions or [],
-    }
-    refined_text = correct_text(transcript, domain_mode=payload.domain_mode, feedback=feedback)
-    validation = validate_transcript_detailed(refined_text, domain_mode=payload.domain_mode)
+    baseline_validation = validate_transcript_detailed(transcript, domain_mode=payload.domain_mode)
+    loop_result = run_feedback_correction_loop(transcript, domain_mode=payload.domain_mode, max_retries=1)
+    refined_text = (loop_result.corrected_text or "").strip() or transcript
+    validation = loop_result.validation or validate_transcript_detailed(refined_text, domain_mode=payload.domain_mode)
+
+    if validation.confidence_score < baseline_validation.confidence_score:
+        return {
+            "ok": baseline_validation.is_valid,
+            "correctedTranscript": transcript,
+            "validation": _serialize_validation(baseline_validation),
+            "message": "Refinement did not improve the transcript, so the previous version was kept.",
+        }
 
     return {
         "ok": validation.is_valid,
@@ -274,3 +289,6 @@ def get_audio(filename: str):
 
     media_type, _ = mimetypes.guess_type(file_path.name)
     return FileResponse(file_path, media_type=media_type or "audio/mpeg", filename=file_path.name)
+
+
+register_live_routes(app)

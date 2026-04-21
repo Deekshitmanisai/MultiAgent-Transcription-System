@@ -1,7 +1,7 @@
 from dataclasses import dataclass, field
 from typing import List
 
-from correction_agent import correct_text
+from correction_agent import correct_text_with_result
 from validation_agent import ValidationResult, validate_transcript_detailed
 
 
@@ -50,7 +50,10 @@ def run_feedback_correction_loop(transcript, domain_mode="meeting", max_retries=
     total_attempts = max(1, int(max_retries or 0) + 1)
     for attempt in range(1, total_attempts + 1):
         try:
-            corrected = correct_text(source_text, domain_mode=domain_mode, feedback=feedback)
+            correction_result = correct_text_with_result(source_text, domain_mode=domain_mode, feedback=feedback)
+            corrected = correction_result.text
+            if correction_result.fallback_reason:
+                errors.append(f"Correction attempt {attempt}: {correction_result.fallback_reason}")
         except Exception as exc:
             errors.append(f"Correction attempt {attempt} failed: {exc}")
             corrected = best_text or source_text

@@ -1,4 +1,5 @@
 import re
+from dataclasses import dataclass
 
 from gemini_service import generate_text
 
@@ -81,15 +82,25 @@ def _split_transcript_chunks(transcript, max_lines=4, max_chars=900):
     return chunks
 
 
+@dataclass
+class CorrectionResult:
+    text: str
+    used_gemini: bool = False
+    fallback_reason: str = ""
+
+
 class CorrectionAgent:
     """
     Fast transcript cleanup using Gemini.
     """
 
     def correct_text(self, transcript, domain_mode="meeting", feedback=None):
+        return self.correct_text_with_result(transcript, domain_mode=domain_mode, feedback=feedback).text
+
+    def correct_text_with_result(self, transcript, domain_mode="meeting", feedback=None):
         cleaned_input = _basic_cleanup(transcript)
         if not cleaned_input:
-            return ""
+            return CorrectionResult(text="")
 
         domain_guidance = {
             "meeting": "Keep the tone professional and natural for workplace meeting notes.",
@@ -168,6 +179,18 @@ class CorrectionAgent:
                 if chunk_mode
                 else "Return the full corrected transcript from beginning to end."
             )
+            refinement_mode = bool(feedback_guidance.strip())
+            refinement_rules = """
+REFINEMENT MODE:
+- Make surgical edits only.
+- Prefer the smallest possible change that improves grammar, readability, or formatting.
+- Do not compress or summarize any sentence.
+- Do not remove a speaker turn unless it is completely empty.
+- Do not merge multiple speaker turns into one.
+- Preserve sequence, meaning, and coverage exactly.
+- If a sentence is awkward but understandable, improve it lightly instead of rewriting it.
+- Preserve uncertainty rather than guessing missing words.
+""".strip() if refinement_mode else ""
             return f"""
 You are an expert transcription editor.
 
@@ -203,6 +226,7 @@ IMPORTANT RULES:
 - Return only the corrected transcript.
 - {chunk_rule}
 {feedback_guidance}
+{refinement_rules}
 
 OUTPUT FORMAT:
 
@@ -218,7 +242,7 @@ Transcript:
             corrected_text = generate_text(
                 prompt,
                 system_instruction="You are an expert clean-verbatim transcription editor.",
-                temperature=0.1,
+                temperature=0.05 if feedback_guidance else 0.1,
                 max_output_tokens=4096,
             )
             return _post_process(corrected_text, text)
@@ -226,7 +250,7 @@ Transcript:
         try:
             corrected = run_correction(cleaned_input)
             if not _looks_incomplete(corrected, cleaned_input):
-                return corrected
+                return CorrectionResult(text=corrected, used_gemini=True)
 
             print("Gemini correction looked incomplete; retrying in smaller chunks.")
             corrected_chunks = []
@@ -243,18 +267,31 @@ Transcript:
 
             chunked_result = "\n".join(part.strip() for part in corrected_chunks if part.strip()).strip()
             if not _looks_incomplete(chunked_result, cleaned_input):
-                return chunked_result
+                return CorrectionResult(text=chunked_result, used_gemini=True)
 
             print("Gemini correction remained incomplete; using untruncated cleaned transcript.")
-            return cleaned_input
+            return CorrectionResult(
+                text=cleaned_input,
+                used_gemini=False,
+                fallback_reason="Gemini returned incomplete correction output; using cleaned transcript.",
+            )
         except Exception as e:
             print(f"Gemini correction issue: {e}")
-            return cleaned_input
+            return CorrectionResult(
+                text=cleaned_input,
+                used_gemini=False,
+                fallback_reason=f"Gemini correction failed: {e}",
+            )
 
 
 def correct_text(transcript, domain_mode="meeting", feedback=None):
     agent = CorrectionAgent()
     return agent.correct_text(transcript, domain_mode=domain_mode, feedback=feedback)
+
+
+def correct_text_with_result(transcript, domain_mode="meeting", feedback=None):
+    agent = CorrectionAgent()
+    return agent.correct_text_with_result(transcript, domain_mode=domain_mode, feedback=feedback)
 
 
 if __name__ == "__main__":
