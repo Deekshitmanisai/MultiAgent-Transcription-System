@@ -1,8 +1,9 @@
 import unittest
+from unittest.mock import patch
 
 from mom_agent import _split_sections
 from simplification_agent import _normalize_simplified_text
-from speaker_diarization import _smooth_speaker_sequence, format_diarized_transcript
+from speaker_diarization import _coerce_speaker_count, _fallback_diarization, _smooth_speaker_sequence, format_diarized_transcript
 from validation_agent import (
     _extract_json_object,
     _normalize_validation_payload,
@@ -104,6 +105,45 @@ Action Items:
             formatted,
             "Person 1: Hello team today we review progress\nPerson 2: Understood",
         )
+
+    def test_auto_speaker_count_coerces_to_numeric_limit(self):
+        self.assertEqual(_coerce_speaker_count("auto"), 2)
+        self.assertEqual(_coerce_speaker_count(None), 2)
+        self.assertEqual(_coerce_speaker_count("4"), 4)
+
+    def test_fallback_diarization_accepts_auto_speaker_count(self):
+        segments = [
+            {"start": 0.0, "end": 2.0, "text": "Morning everyone"},
+            {"start": 2.2, "end": 4.0, "text": "Yes, let us begin"},
+        ]
+        profiles = [
+            {"vector": [1.0, 0.0], "pitch_mean": 150.0, "voiced_ratio": 0.8, "channel_balance": 0.0},
+            {"vector": [0.0, 1.0], "pitch_mean": 220.0, "voiced_ratio": 0.7, "channel_balance": 0.0},
+        ]
+        diarized = _fallback_diarization(segments, profiles, "auto")
+        self.assertEqual(len(diarized), 2)
+        self.assertTrue(all("speaker" in segment for segment in diarized))
+
+    def test_fallback_diarization_preserves_explicit_speaker_count_when_smoothing_collapses_it(self):
+        segments = [
+            {"start": 0.0, "end": 1.0, "text": "speaker one"},
+            {"start": 1.0, "end": 2.0, "text": "speaker two"},
+            {"start": 2.0, "end": 3.0, "text": "speaker three"},
+            {"start": 3.0, "end": 4.0, "text": "speaker four"},
+        ]
+        profiles = [
+            {"vector": [1.0, 0.0]},
+            {"vector": [0.0, 1.0]},
+            {"vector": [1.0, 1.0]},
+            {"vector": [0.5, 0.5]},
+        ]
+
+        with patch("speaker_diarization._assign_profiles_online", return_value=[1, 2, 3, 4]), patch(
+            "speaker_diarization._smooth_speaker_sequence", return_value=[1, 1, 2, 2]
+        ):
+            diarized = _fallback_diarization(segments, profiles, 4)
+
+        self.assertEqual([segment["speaker"] for segment in diarized], [1, 2, 3, 4])
 
 
 if __name__ == "__main__":

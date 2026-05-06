@@ -7,7 +7,7 @@ def _segment_duration(segment):
     return max(0.0, end - start)
 
 
-def _turn_taking_speakers(segments):
+def _heuristic_turn_taking_speakers(segments):
     if not segments:
         return []
 
@@ -80,22 +80,43 @@ def _turn_taking_speakers(segments):
     return [{**segment, "speaker": int(speakers[i])} for i, segment in enumerate(segments)]
 
 
-def _extract_segment_features(y, sr, segment, librosa):
+def _cosine_distance(a, b):
+    denom = float(np.linalg.norm(a) * np.linalg.norm(b))
+    if denom <= 1e-8:
+        return 1.0
+    similarity = float(np.dot(a, b) / denom)
+    similarity = max(-1.0, min(1.0, similarity))
+    return 1.0 - similarity
+
+
+def _build_segment_profile(y, sr, segment, librosa):
     start = float(segment.get("start", 0.0))
     end = float(segment.get("end", start))
     duration = max(0.0, end - start)
     if duration <= 0:
         return None
 
-    min_window = 1.2
+    min_window = 1.6
     center = 0.5 * (start + end)
     half_window = 0.5 * max(min_window, duration)
     sample_a = int(max(0, (center - half_window) * sr))
-    sample_b = int(min(len(y), (center + half_window) * sr))
-    if sample_b - sample_a < int(0.35 * sr):
+    sample_b = int(min(y.shape[-1], (center + half_window) * sr))
+    if sample_b - sample_a < int(0.45 * sr):
         return None
 
-    seg = y[sample_a:sample_b]
+    if getattr(y, "ndim", 1) > 1:
+        seg_channels = y[:, sample_a:sample_b]
+        seg = np.mean(seg_channels, axis=0)
+        channel_rms = np.sqrt(np.mean(np.square(seg_channels), axis=1) + 1e-8)
+        total_channel_rms = float(np.sum(channel_rms))
+        if total_channel_rms > 1e-8 and len(channel_rms) >= 2:
+            channel_balance = float((channel_rms[0] - channel_rms[1]) / total_channel_rms)
+        else:
+            channel_balance = 0.0
+    else:
+        seg = y[sample_a:sample_b]
+        channel_balance = 0.0
+
     if not np.any(np.abs(seg) > 1e-5):
         return None
 
@@ -106,28 +127,22 @@ def _extract_segment_features(y, sr, segment, librosa):
     try:
         mfcc = librosa.feature.mfcc(y=seg, sr=sr, n_mfcc=13)
         delta = librosa.feature.delta(mfcc)
-        delta2 = librosa.feature.delta(mfcc, order=2)
         spectral_centroid = librosa.feature.spectral_centroid(y=seg, sr=sr)
         spectral_bandwidth = librosa.feature.spectral_bandwidth(y=seg, sr=sr)
-        spectral_rolloff = librosa.feature.spectral_rolloff(y=seg, sr=sr)
         zero_crossing = librosa.feature.zero_crossing_rate(seg)
         rms = librosa.feature.rms(y=seg, hop_length=hop_length)
-
-        try:
-            spectral_contrast = librosa.feature.spectral_contrast(y=seg, sr=sr)
-        except Exception:
-            spectral_contrast = np.zeros((7, max(1, mfcc.shape[1])), dtype=np.float32)
-
-        try:
-            chroma = librosa.feature.chroma_stft(y=seg, sr=sr)
-        except Exception:
-            chroma = np.zeros((12, max(1, mfcc.shape[1])), dtype=np.float32)
 
         f0, voiced_flag, _ = librosa.pyin(seg, fmin=fmin, fmax=fmax, sr=sr, hop_length=hop_length)
         f0 = np.array([]) if f0 is None else f0
         voiced_flag = np.array([]) if voiced_flag is None else voiced_flag
         f0_valid = f0[np.isfinite(f0)] if f0.size else np.array([])
         voiced_ratio = float(np.mean(voiced_flag.astype(np.float32))) if voiced_flag.size else 0.0
+        pitch_mean = float(np.mean(f0_valid)) if f0_valid.size else 0.0
+        pitch_std = float(np.std(f0_valid)) if f0_valid.size else 0.0
+        rms_mean = float(np.mean(rms)) if rms.size else 0.0
+        rms_std = float(np.std(rms)) if rms.size else 0.0
+        zcr_mean = float(np.mean(zero_crossing)) if zero_crossing.size else 0.0
+        zcr_std = float(np.std(zero_crossing)) if zero_crossing.size else 0.0
 
         pause_before = float(segment.get("_pause_before", 0.0))
         text = (segment.get("text") or "").strip()
@@ -138,21 +153,18 @@ def _extract_segment_features(y, sr, segment, librosa):
                 mfcc.mean(axis=1),
                 mfcc.std(axis=1),
                 delta.mean(axis=1),
-                delta2.mean(axis=1),
                 spectral_centroid.mean(axis=1),
                 spectral_bandwidth.mean(axis=1),
-                spectral_rolloff.mean(axis=1),
-                spectral_contrast.mean(axis=1),
-                chroma.mean(axis=1),
                 np.array(
                     [
-                        float(np.mean(rms)) if rms.size else 0.0,
-                        float(np.std(rms)) if rms.size else 0.0,
-                        float(np.mean(zero_crossing)) if zero_crossing.size else 0.0,
-                        float(np.std(zero_crossing)) if zero_crossing.size else 0.0,
-                        float(np.mean(f0_valid)) if f0_valid.size else 0.0,
-                        float(np.std(f0_valid)) if f0_valid.size else 0.0,
+                        rms_mean,
+                        rms_std,
+                        zcr_mean,
+                        zcr_std,
+                        pitch_mean,
+                        pitch_std,
                         voiced_ratio,
+                        channel_balance,
                         duration,
                         pause_before,
                         min(400.0, float(text_len)) / 400.0,
@@ -162,9 +174,24 @@ def _extract_segment_features(y, sr, segment, librosa):
             ],
             axis=0,
         )
-        return feature_vector.astype(np.float32)
+
+        return {
+            "vector": feature_vector.astype(np.float32),
+            "pitch_mean": pitch_mean,
+            "pitch_std": pitch_std,
+            "voiced_ratio": voiced_ratio,
+            "rms_mean": rms_mean,
+            "channel_balance": channel_balance,
+            "duration": duration,
+            "pause_before": pause_before,
+        }
     except Exception:
         return None
+
+
+def _extract_segment_features(y, sr, segment, librosa):
+    profile = _build_segment_profile(y, sr, segment, librosa)
+    return None if profile is None else profile["vector"]
 
 
 def _normalize_features(X, StandardScaler):
@@ -183,6 +210,18 @@ def _cluster_features(X, n_speakers, AgglomerativeClustering):
 
     model = AgglomerativeClustering(n_clusters=cluster_count, linkage="ward")
     return model.fit_predict(X)
+
+
+def _coerce_speaker_count(n_speakers, default=2, max_speakers=6):
+    try:
+        normalized = int(n_speakers)
+    except (TypeError, ValueError):
+        normalized = int(default)
+    return max(1, min(int(max_speakers), normalized))
+
+
+def _count_unique_speakers(speakers):
+    return len({int(speaker) for speaker in speakers if int(speaker) > 0})
 
 
 def _estimate_speaker_count(X, AgglomerativeClustering, silhouette_score, max_speakers=6):
@@ -211,12 +250,120 @@ def _estimate_speaker_count(X, AgglomerativeClustering, silhouette_score, max_sp
     return best_count
 
 
+def _profile_distance(feature_vector, speaker_profile, profile_meta=None):
+    distance = _cosine_distance(feature_vector, speaker_profile["centroid"])
+
+    if profile_meta:
+        pitch_mean = float(profile_meta.get("pitch_mean", 0.0) or 0.0)
+        speaker_pitch = float(speaker_profile.get("pitch_mean", 0.0) or 0.0)
+        if pitch_mean > 0.0 and speaker_pitch > 0.0:
+            octave_gap = abs(np.log2(pitch_mean / speaker_pitch))
+            distance += min(0.35, octave_gap * 0.25)
+
+        voiced_ratio = float(profile_meta.get("voiced_ratio", 0.0) or 0.0)
+        speaker_voiced = float(speaker_profile.get("voiced_ratio", 0.0) or 0.0)
+        distance += min(0.15, abs(voiced_ratio - speaker_voiced) * 0.2)
+
+        channel_balance = float(profile_meta.get("channel_balance", 0.0) or 0.0)
+        speaker_balance = float(speaker_profile.get("channel_balance", 0.0) or 0.0)
+        distance += min(0.2, abs(channel_balance - speaker_balance) * 0.35)
+
+    return float(distance)
+
+
+def _assign_profiles_online(profiles, max_speakers=2, distance_threshold=0.32):
+    if not profiles:
+        return []
+
+    assignments = []
+    speaker_profiles = []
+    previous_speaker = None
+
+    for profile in profiles:
+        if profile is None:
+            assignments.append(None)
+            continue
+
+        feature_vector = profile["vector"]
+        if not speaker_profiles:
+            speaker_profiles.append(
+                {
+                    "speaker_id": 1,
+                    "centroid": feature_vector.copy(),
+                    "pitch_mean": float(profile.get("pitch_mean", 0.0) or 0.0),
+                    "voiced_ratio": float(profile.get("voiced_ratio", 0.0) or 0.0),
+                    "channel_balance": float(profile.get("channel_balance", 0.0) or 0.0),
+                    "count": 1,
+                }
+            )
+            assignments.append(1)
+            previous_speaker = 1
+            continue
+
+        ranked = sorted(
+            (
+                _profile_distance(feature_vector, speaker_profile, profile),
+                speaker_profile,
+            )
+            for speaker_profile in speaker_profiles
+        )
+        best_distance, best_profile = ranked[0]
+        previous_profile = None
+        if previous_speaker is not None:
+            previous_profile = next(
+                (speaker for speaker in speaker_profiles if speaker["speaker_id"] == previous_speaker),
+                None,
+            )
+
+        # Prefer continuity when the previous speaker is still a close match.
+        if previous_profile is not None:
+            previous_distance = _profile_distance(feature_vector, previous_profile, profile)
+            if previous_distance <= best_distance + 0.08:
+                best_distance = previous_distance
+                best_profile = previous_profile
+
+        chosen_speaker = None
+        if best_distance <= distance_threshold:
+            chosen_speaker = int(best_profile["speaker_id"])
+            count = best_profile["count"]
+            best_profile["centroid"] = (best_profile["centroid"] * count + feature_vector) / float(count + 1)
+            best_profile["pitch_mean"] = (
+                (best_profile["pitch_mean"] * count) + float(profile.get("pitch_mean", 0.0) or 0.0)
+            ) / float(count + 1)
+            best_profile["voiced_ratio"] = (
+                (best_profile["voiced_ratio"] * count) + float(profile.get("voiced_ratio", 0.0) or 0.0)
+            ) / float(count + 1)
+            best_profile["channel_balance"] = (
+                (best_profile["channel_balance"] * count) + float(profile.get("channel_balance", 0.0) or 0.0)
+            ) / float(count + 1)
+            best_profile["count"] = count + 1
+        elif len(speaker_profiles) < max(1, int(max_speakers or 1)):
+            chosen_speaker = len(speaker_profiles) + 1
+            speaker_profiles.append(
+                {
+                    "speaker_id": chosen_speaker,
+                    "centroid": feature_vector.copy(),
+                    "pitch_mean": float(profile.get("pitch_mean", 0.0) or 0.0),
+                    "voiced_ratio": float(profile.get("voiced_ratio", 0.0) or 0.0),
+                    "channel_balance": float(profile.get("channel_balance", 0.0) or 0.0),
+                    "count": 1,
+                }
+            )
+        else:
+            chosen_speaker = int(best_profile["speaker_id"])
+
+        assignments.append(chosen_speaker)
+        previous_speaker = chosen_speaker
+
+    return assignments
+
+
 def _assign_missing_labels(speakers, valid_idx, segments):
     if not valid_idx:
         return speakers
 
     for i in range(len(speakers)):
-        if speakers[i] != 1 or i in valid_idx:
+        if speakers[i] > 0 or i in valid_idx:
             continue
 
         left = None
@@ -292,6 +439,50 @@ def _smooth_speaker_sequence(speakers, segments):
     return smoothed
 
 
+def _reindex_speakers_by_first_appearance(segments):
+    if not segments:
+        return []
+
+    speaker_map = {}
+    next_speaker_id = 1
+    normalized_segments = []
+
+    for segment in segments:
+        original_speaker = int(segment.get("speaker", 1) or 1)
+        if original_speaker not in speaker_map:
+            speaker_map[original_speaker] = next_speaker_id
+            next_speaker_id += 1
+        normalized_segments.append({**segment, "speaker": int(speaker_map[original_speaker])})
+
+    return normalized_segments
+
+
+def _fallback_diarization(segments, profiles, n_speakers):
+    valid_profiles = [profile for profile in profiles if profile is not None]
+    if len(valid_profiles) >= 2:
+        fallback_speaker_limit = _coerce_speaker_count(
+            n_speakers,
+            default=min(2, len(valid_profiles)) or 1,
+            max_speakers=max(2, len(valid_profiles)),
+        )
+        assignments = _assign_profiles_online(valid_profiles, max_speakers=fallback_speaker_limit)
+        speakers = np.zeros(len(segments), dtype=int)
+        valid_idx = [i for i, profile in enumerate(profiles) if profile is not None]
+        for idx, speaker_id in zip(valid_idx, assignments):
+            speakers[idx] = int(speaker_id or 0)
+        speakers = _assign_missing_labels(speakers, set(valid_idx), segments)
+        smoothed_speakers = _smooth_speaker_sequence(speakers, segments)
+        if _count_unique_speakers(smoothed_speakers) < min(fallback_speaker_limit, len(valid_profiles)):
+            final_speakers = speakers
+        else:
+            final_speakers = smoothed_speakers
+        if _count_unique_speakers(final_speakers) >= 2:
+            normalized = [{**segment, "speaker": int(max(1, final_speakers[i]))} for i, segment in enumerate(segments)]
+            return _reindex_speakers_by_first_appearance(normalized)
+
+    return _reindex_speakers_by_first_appearance(_heuristic_turn_taking_speakers(segments))
+
+
 def diarize_segments(audio_path, segments, n_speakers=2):
     if not segments:
         return []
@@ -313,37 +504,42 @@ def diarize_segments(audio_path, segments, n_speakers=2):
         from sklearn.preprocessing import StandardScaler
     except Exception as exc:
         print(f"Diarization dependency issue: {exc}")
-        return _turn_taking_speakers(segments)
+        return _heuristic_turn_taking_speakers(segments)
 
     try:
-        y, sr = librosa.load(audio_path, sr=16000, mono=True)
+        y, sr = librosa.load(audio_path, sr=16000, mono=False)
     except Exception as exc:
         print(f"Audio load error: {exc}")
         return [{**segment, "speaker": 1} for segment in segments]
 
+    profiles = []
     features = []
     valid_idx = []
     for i, segment in enumerate(enriched_segments):
-        feature_vector = _extract_segment_features(y, sr, segment, librosa)
-        if feature_vector is None:
+        profile = _build_segment_profile(y, sr, segment, librosa)
+        profiles.append(profile)
+        if profile is None:
             continue
-        features.append(feature_vector)
+        features.append(profile["vector"])
         valid_idx.append(i)
 
     if len(features) < 2:
-        return _turn_taking_speakers(segments)
+        return _fallback_diarization(segments, profiles, n_speakers)
 
     X = np.stack(features, axis=0)
     X = _normalize_features(X, StandardScaler)
 
+    auto_detect_requested = n_speakers in (None, "", 0, "0", "auto")
     target_speakers = n_speakers
-    if target_speakers in (None, "", 0, "0", "auto"):
+    if auto_detect_requested:
         target_speakers = _estimate_speaker_count(
             X,
             AgglomerativeClustering=AgglomerativeClustering,
             silhouette_score=silhouette_score,
             max_speakers=6,
         )
+    else:
+        target_speakers = _coerce_speaker_count(target_speakers, default=2, max_speakers=len(features))
 
     try:
         labels = _cluster_features(
@@ -353,20 +549,43 @@ def diarize_segments(audio_path, segments, n_speakers=2):
         )
     except Exception as exc:
         print(f"Diarization clustering error: {exc}")
-        return _turn_taking_speakers(segments)
+        return _fallback_diarization(segments, profiles, target_speakers)
 
-    speakers = np.ones(len(segments), dtype=int)
+    clustering_confidence = 0.0
+    if len(set(labels)) >= 2 and len(labels) >= 3:
+        try:
+            clustering_confidence = float(silhouette_score(X, labels))
+        except Exception:
+            clustering_confidence = 0.0
+    if auto_detect_requested and (len(set(labels)) < 2 or clustering_confidence < 0.02):
+        return _fallback_diarization(segments, profiles, target_speakers)
+
+    speakers = np.zeros(len(segments), dtype=int)
     for idx, label in zip(valid_idx, labels):
         speakers[idx] = int(label) + 1
 
-    speakers = _assign_missing_labels(speakers, set(valid_idx), segments)
-    speakers = _smooth_speaker_sequence(speakers, segments)
+    raw_speakers = _assign_missing_labels(speakers, set(valid_idx), segments)
+    smoothed_speakers = _smooth_speaker_sequence(raw_speakers, segments)
+
+    if auto_detect_requested:
+        speakers = smoothed_speakers
+    else:
+        requested_unique_count = min(int(target_speakers), len(valid_idx))
+        if _count_unique_speakers(smoothed_speakers) < requested_unique_count:
+            speakers = raw_speakers
+        else:
+            speakers = smoothed_speakers
 
     unique = set(int(speakers[i]) for i in valid_idx) if valid_idx else {1}
-    if len(unique) < 2 and len(segments) >= 2:
-        return _turn_taking_speakers(segments)
+    if auto_detect_requested and len(unique) < 2 and len(segments) >= 2:
+        return _fallback_diarization(segments, profiles, target_speakers)
 
-    return [{**segment, "speaker": int(speakers[i])} for i, segment in enumerate(segments)]
+    normalized = [{**segment, "speaker": int(speakers[i])} for i, segment in enumerate(segments)]
+    return _reindex_speakers_by_first_appearance(normalized)
+
+
+def _turn_taking_speakers(segments):
+    return _heuristic_turn_taking_speakers(segments)
 
 
 def format_diarized_transcript(segments_with_speakers, speaker_prefix="Person"):

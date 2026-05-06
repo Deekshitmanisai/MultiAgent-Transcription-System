@@ -8,4 +8,4 @@ if (-not (Test-Path $pythonExe)) {
 }
 
 Set-Location $projectRoot
-& $pythonExe -m uvicorn backend_api:app --host 127.0.0.1 --port 8000 --reload
+& $pythonExe -m uvicorn backend_api:app --host 127.0.0.1 --port 8000

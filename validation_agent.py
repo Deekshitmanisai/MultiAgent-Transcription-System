@@ -7,7 +7,13 @@ from typing import Dict, List
 
 from config import OPENROUTER_API_KEY, OPENROUTER_VALIDATION_MODEL
 from decision_engine import decide_verdict, is_valid_verdict
-from scoring_engine import calculate_confidence_score, missing_metric_issues, normalize_metric_scores
+from scoring_engine import (
+    calculate_confidence_score,
+    missing_metric_issues,
+    normalize_metric_scores,
+    to_ten_point_scores,
+    total_ten_point_score,
+)
 
 
 ERROR_MARKERS = (
@@ -32,6 +38,8 @@ class ValidationResult:
     editor_feedback: str = ""
     validator: str = "openrouter"
     metric_scores: Dict[str, int] = field(default_factory=dict)
+    scores: Dict[str, int] = field(default_factory=dict)
+    total: int = 0
     critical_issues: List[str] = field(default_factory=list)
 
 
@@ -177,12 +185,23 @@ def _normalize_validation_payload(payload):
             payload.get("editor_feedback", payload.get("english_feedback", ""))
         ).strip(),
         "metric_scores": metric_scores,
+        "scores": to_ten_point_scores(metric_scores),
+        "total": total_ten_point_score(metric_scores),
         "critical_issues": critical_issues,
     }
 
 
 class FinalValidationAgent:
-    def validate(self, corrected_text, domain_mode="meeting"):
+    def validate(
+        self,
+        corrected_text,
+        domain_mode="meeting",
+        source_language="en",
+        normalization_mode="keep-mixed",
+        is_mixed=False,
+        stage_label="corrected",
+        original_text="",
+    ):
         text = (corrected_text or "").strip()
         if not text:
             return ValidationResult(
@@ -203,7 +222,17 @@ class FinalValidationAgent:
                     "sentence_structure": 0,
                     "completeness": 0,
                     "noise_reduction": 0,
+                    "code_switch_consistency": 0,
                 },
+                scores={
+                    "grammar": 0,
+                    "clarity": 0,
+                    "readability": 0,
+                    "completeness": 0,
+                    "noise": 0,
+                    "code_switch_consistency": 0,
+                },
+                total=0,
                 critical_issues=["Transcript is empty."],
             )
 
@@ -227,7 +256,17 @@ class FinalValidationAgent:
                     "sentence_structure": 0,
                     "completeness": 0,
                     "noise_reduction": 0,
+                    "code_switch_consistency": 0,
                 },
+                scores={
+                    "grammar": 0,
+                    "clarity": 0,
+                    "readability": 0,
+                    "completeness": 0,
+                    "noise": 0,
+                    "code_switch_consistency": 0,
+                },
+                total=0,
                 critical_issues=guardrail_issues,
             )
 
@@ -237,6 +276,19 @@ class FinalValidationAgent:
             "interview": "Judge it as an interview transcript with speaker turns.",
             "discussion": "Judge it as a conversational discussion transcript.",
         }.get((domain_mode or "meeting").strip().lower(), "Judge it as a general spoken transcript.")
+        language_guidance = (
+            "The transcript is in Hindi and may include natural English code-mixing. Evaluate quality in Hindi, "
+            "but write editor_feedback in English."
+            if (source_language or "en").strip().lower() == "hi"
+            else f"The transcript is in {(source_language or 'its original language').strip()}. "
+            "Evaluate quality in that language, but write editor_feedback in English."
+        )
+        normalization_guidance = f"""
+This transcript stage is: {stage_label}.
+Original raw transcript may have mixed Hindi-English content: {bool(is_mixed)}.
+Requested normalization mode: {normalization_mode}.
+If the transcript should be normalized, evaluate whether the chosen language is consistent and whether meaning from the original transcript is preserved.
+""".strip()
 
         prompt = f"""
 Review the final corrected transcript for quality.
@@ -248,8 +300,11 @@ Use these criteria and scores from 0 to 100:
 3. sentence_structure, weight 20: proper sentence boundaries, no run-on sentences, good formatting.
 4. completeness, weight 15: meaning preserved, no missing or distorted information.
 5. noise_reduction, weight 10: filler words and unnecessary repetitions are removed where appropriate.
+6. code_switch_consistency, weight 20: mixed Hindi-English content is normalized consistently when required, or preserved coherently when keep-mixed is intended.
 
 {domain_guidance}
+{language_guidance}
+{normalization_guidance}
 
 Return JSON only with this exact shape:
 {{
@@ -258,13 +313,14 @@ Return JSON only with this exact shape:
     "clarity_readability": 0,
     "sentence_structure": 0,
     "completeness": 0,
-    "noise_reduction": 0
+    "noise_reduction": 0,
+    "code_switch_consistency": 0
   }},
   "summary": "short summary",
   "issues": ["issue"],
   "strengths": ["strength"],
   "suggestions": ["action"],
-  "improvement_categories": ["grammar", "clarity", "sentence_structure", "completeness", "noise_reduction", "speaker_formatting", "contextual_accuracy"],
+  "improvement_categories": ["grammar", "clarity", "sentence_structure", "completeness", "noise_reduction", "code_switch_consistency", "speaker_formatting", "contextual_accuracy", "normalization"],
   "editor_feedback": "English instructions for the transcript editor describing what to improve and what to preserve.",
   "critical_issues": ["critical issue"]
 }}
@@ -276,12 +332,16 @@ Rules:
 - write editor_feedback in plain English for another AI editor
 - editor_feedback must explain what is wrong, what should be improved, and what must be preserved
 - improvement_categories should name the main error types seen in the transcript
+- use code_switch_consistency or normalization when mixed-language normalization is incomplete or inconsistent
 - use contextual_accuracy when wording changes, unclear meaning, or context drift are present
 - use speaker_formatting when speaker labels or turn structure need repair
 - put meaning changes, missing content, hallucinated content, or malformed speaker labels in critical_issues
 - use an empty list when there are no items
 - do not include confidence_score or verdict; those are computed deterministically by the app
 - return JSON only
+
+Original raw transcript for meaning comparison:
+{original_text or text}
 
 Transcript:
 {text}
@@ -299,6 +359,14 @@ Transcript:
             )
             payload = _normalize_validation_payload(_extract_json_object(response_text))
         except Exception as exc:
+            metric_scores = {
+                "grammar_correctness": 0,
+                "clarity_readability": 0,
+                "sentence_structure": 0,
+                "completeness": 0,
+                "noise_reduction": 0,
+                "code_switch_consistency": 0,
+            }
             return ValidationResult(
                 is_valid=False,
                 verdict="unavailable",
@@ -311,6 +379,9 @@ Transcript:
                     "Validation feedback was unavailable because OpenRouter could not complete the review. "
                     "Keep meaning and speaker turns intact if you retry correction."
                 ),
+                metric_scores=metric_scores,
+                scores=to_ten_point_scores(metric_scores),
+                total=total_ten_point_score(metric_scores),
             )
 
         if not payload:
@@ -320,6 +391,7 @@ Transcript:
                 "sentence_structure": 0,
                 "completeness": 0,
                 "noise_reduction": 0,
+                "code_switch_consistency": 0,
             }
             return ValidationResult(
                 is_valid=False,
@@ -334,6 +406,8 @@ Transcript:
                     "meaning and speaker turns and focus on grammar, clarity, and formatting."
                 ),
                 metric_scores=metric_scores,
+                scores=to_ten_point_scores(metric_scores),
+                total=total_ten_point_score(metric_scores),
             )
 
         if not payload["summary"]:
@@ -342,10 +416,42 @@ Transcript:
         return ValidationResult(**payload)
 
 
-def validate_transcript_detailed(corrected_text, domain_mode="meeting"):
+def validate_transcript_detailed(
+    corrected_text,
+    domain_mode="meeting",
+    source_language="en",
+    normalization_mode="keep-mixed",
+    is_mixed=False,
+    stage_label="corrected",
+    original_text="",
+):
     agent = FinalValidationAgent()
-    return agent.validate(corrected_text, domain_mode=domain_mode)
+    return agent.validate(
+        corrected_text,
+        domain_mode=domain_mode,
+        source_language=source_language,
+        normalization_mode=normalization_mode,
+        is_mixed=is_mixed,
+        stage_label=stage_label,
+        original_text=original_text,
+    )
 
 
-def validate_transcript(corrected_text, domain_mode="meeting"):
-    return validate_transcript_detailed(corrected_text, domain_mode=domain_mode).is_valid
+def validate_transcript(
+    corrected_text,
+    domain_mode="meeting",
+    source_language="en",
+    normalization_mode="keep-mixed",
+    is_mixed=False,
+    stage_label="corrected",
+    original_text="",
+):
+    return validate_transcript_detailed(
+        corrected_text,
+        domain_mode=domain_mode,
+        source_language=source_language,
+        normalization_mode=normalization_mode,
+        is_mixed=is_mixed,
+        stage_label=stage_label,
+        original_text=original_text,
+    ).is_valid

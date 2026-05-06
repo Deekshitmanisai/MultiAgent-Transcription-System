@@ -37,7 +37,7 @@ def extract_audio(video_path, output_audio=None):
             .output(
                 output_audio,
                 acodec='pcm_s16le',
-                ac=1,                
+                ac=2,
                 ar='16000'           
             )
             .run(cmd=ffmpeg_executable or "ffmpeg", overwrite_output=True)

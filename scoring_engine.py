@@ -4,6 +4,7 @@ CRITERIA_WEIGHTS = {
     "sentence_structure": 20,
     "completeness": 15,
     "noise_reduction": 10,
+    "code_switch_consistency": 20,
 }
 
 
@@ -13,6 +14,7 @@ CRITERIA_LABELS = {
     "sentence_structure": "Sentence Structure",
     "completeness": "Completeness",
     "noise_reduction": "Noise Reduction",
+    "code_switch_consistency": "Code-Switch Consistency",
 }
 
 
@@ -34,11 +36,16 @@ _ALIASES = {
     "noiseReduction": "noise_reduction",
     "filler_removal": "noise_reduction",
     "fillerRemoval": "noise_reduction",
+    "code_switch_consistency": "code_switch_consistency",
+    "codeSwitchConsistency": "code_switch_consistency",
+    "code_switch": "code_switch_consistency",
+    "normalization_consistency": "code_switch_consistency",
 }
 
 
 def clamp_score(value, default=0):
     try:
+        score = int(round(float(value)))
         score = int(round(float(value)))
     except (TypeError, ValueError):
         score = default
@@ -60,11 +67,29 @@ def normalize_metric_scores(raw_scores):
 def calculate_confidence_score(metric_scores):
     normalized = normalize_metric_scores(metric_scores)
     weighted_total = 0.0
+    total_weight = float(sum(CRITERIA_WEIGHTS.values()) or 1.0)
 
     for key, weight in CRITERIA_WEIGHTS.items():
-        weighted_total += normalized[key] * (weight / 100.0)
+        weighted_total += normalized[key] * (weight / total_weight)
 
     return clamp_score(weighted_total)
+
+
+def to_ten_point_scores(metric_scores):
+    normalized = normalize_metric_scores(metric_scores)
+    score_map = {
+        "grammar": round(normalized["grammar_correctness"] / 10),
+        "clarity": round(normalized["clarity_readability"] / 10),
+        "readability": round(normalized["sentence_structure"] / 10),
+        "completeness": round(normalized["completeness"] / 10),
+        "noise": round(normalized["noise_reduction"] / 10),
+        "code_switch_consistency": round(normalized["code_switch_consistency"] / 10),
+    }
+    return {key: max(0, min(10, int(value))) for key, value in score_map.items()}
+
+
+def total_ten_point_score(metric_scores):
+    return sum(to_ten_point_scores(metric_scores).values())
 
 
 def missing_metric_issues(metric_scores):
@@ -77,3 +102,4 @@ def missing_metric_issues(metric_scores):
             missing.append(f"Validation model did not provide a {label} score.")
 
     return missing
+    return missin

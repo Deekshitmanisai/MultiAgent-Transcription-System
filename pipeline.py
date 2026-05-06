@@ -3,8 +3,11 @@ from typing import Any, Dict, List, Optional
 
 from audio_extraction import extract_audio
 from pipeline_controller import run_feedback_correction_loop
+from services.code_switch_service import normalize_code_switch
+from services.subtitle_service import build_srt_from_segments
+from services.translation_service import build_multilingual_transcripts
 from speaker_diarization import diarize_segments, format_diarized_transcript
-from speech_to_text import transcribe_audio_with_segments
+from speech_to_text import transcribe_audio_detailed
 from validation_agent import ValidationResult
 
 
@@ -22,8 +25,15 @@ class StageResult:
 class PipelineResult:
     ok: bool
     raw_transcript: str = ""
+    normalized_transcript: str = ""
     speaker_transcript: str = ""
     corrected_transcript: str = ""
+    detected_language: str = "unknown"
+    original_language: str = "unknown"
+    is_mixed: bool = False
+    normalization_mode: str = "keep-mixed"
+    transcripts: Dict[str, str] = field(default_factory=dict)
+    subtitles: Dict[str, str] = field(default_factory=dict)
     timestamped_transcript: str = ""
     segments: List[Dict[str, Any]] = field(default_factory=list)
     validation: ValidationResult = field(default_factory=ValidationResult)
@@ -38,6 +48,7 @@ def run_transcription_pipeline(
     speaker_count,
     transcription_language="auto",
     domain_mode="meeting",
+    normalization_mode="hindi",
 ) -> PipelineResult:
     if not video_path:
         return PipelineResult(ok=False, errors=["Please upload a video file."])
@@ -54,10 +65,26 @@ def run_transcription_pipeline(
             errors=[transcription_stage.error],
         )
 
-    raw_transcript, segments = transcription_stage.data
+    transcription_data = transcription_stage.data or {}
+    raw_transcript = transcription_data.get("text", "")
+    segments = transcription_data.get("segments", [])
+    detected_language = transcription_data.get("language", "unknown")
+    is_mixed = bool(transcription_data.get("is_mixed"))
     diarization_stage = _diarization_stage(audio_stage.data, segments, speaker_count)
-    transcript_for_correction = diarization_stage.data.get("speaker_transcript") if diarization_stage.ok else raw_transcript
-    correction_loop = _correction_stage(transcript_for_correction or raw_transcript, domain_mode=domain_mode)
+    normalized_transcript = _normalization_stage(
+        raw_transcript,
+        source_language=detected_language,
+        is_mixed=is_mixed,
+        normalization_mode=normalization_mode,
+    )
+    correction_loop = _correction_stage(
+        normalized_transcript,
+        domain_mode=domain_mode,
+        source_language=detected_language,
+        is_mixed=is_mixed,
+        normalization_mode=normalization_mode,
+        original_text=raw_transcript,
+    )
 
     validation = correction_loop.validation
     errors = []
@@ -68,11 +95,25 @@ def run_transcription_pipeline(
 
     audio_quality = _estimate_audio_quality(audio_stage.data)
     diarization_data = diarization_stage.data or {}
+    multilingual_transcripts = _translation_stage(
+        correction_loop.data or "",
+        source_language=detected_language,
+        validation=validation,
+        errors=errors,
+    )
+    subtitles = _subtitle_stage(multilingual_transcripts, diarization_data.get("segments", []))
     return PipelineResult(
         ok=bool(raw_transcript and correction_loop.data),
         raw_transcript=raw_transcript,
+        normalized_transcript=correction_loop.meta.get("normalized_text", "") or normalized_transcript,
         speaker_transcript=diarization_data.get("speaker_transcript", ""),
         corrected_transcript=correction_loop.data or "",
+        detected_language=detected_language,
+        original_language=detected_language,
+        is_mixed=is_mixed,
+        normalization_mode=normalization_mode,
+        transcripts=multilingual_transcripts,
+        subtitles=subtitles,
         timestamped_transcript=diarization_data.get("timestamped_transcript", ""),
         segments=diarization_data.get("segments", []),
         validation=validation,
@@ -80,11 +121,16 @@ def run_transcription_pipeline(
         audio_path=audio_stage.data or "",
         audio_quality=audio_quality,
         meta={
+            "detectedLanguage": detected_language,
+            "originalLanguage": detected_language,
+            "isMixed": is_mixed,
+            "normalizationMode": normalization_mode,
             "transcriptionLanguage": transcription_language or "auto",
             "domainMode": domain_mode or "meeting",
             "speakerCount": 0 if str(speaker_count).strip().lower() == "auto" else int(speaker_count),
             "feedbackAttempts": correction_loop.meta.get("attempts", 0),
             "feedbackHistory": correction_loop.meta.get("feedback_history", []),
+            "transcripts": multilingual_transcripts,
         },
     )
 
@@ -98,13 +144,14 @@ def _extract_audio_stage(video_path) -> StageResult:
 
 def _transcription_stage(audio_path, transcription_language="auto") -> StageResult:
     try:
-        raw_transcript, segments = transcribe_audio_with_segments(audio_path, language=transcription_language)
+        transcription = transcribe_audio_detailed(audio_path, language=transcription_language)
     except Exception as exc:
         return StageResult(ok=False, error=f"Transcription failed: {exc}")
 
+    raw_transcript = (transcription.get("text") or "").strip()
     if not raw_transcript.strip():
         return StageResult(ok=False, error="Transcription produced no text.")
-    return StageResult(ok=True, data=(raw_transcript, segments))
+    return StageResult(ok=True, data=transcription)
 
 
 def _diarization_stage(audio_path, segments, speaker_count) -> StageResult:
@@ -128,8 +175,22 @@ def _diarization_stage(audio_path, segments, speaker_count) -> StageResult:
         return StageResult(ok=False, data={}, error=f"Speaker diarization issue: {exc}")
 
 
-def _correction_stage(transcript, domain_mode="meeting") -> StageResult:
-    loop_result = run_feedback_correction_loop(transcript, domain_mode=domain_mode)
+def _correction_stage(
+    transcript,
+    domain_mode="meeting",
+    source_language="en",
+    is_mixed=False,
+    normalization_mode="keep-mixed",
+    original_text="",
+) -> StageResult:
+    loop_result = run_feedback_correction_loop(
+        transcript,
+        domain_mode=domain_mode,
+        source_language=source_language,
+        is_mixed=is_mixed,
+        normalization_mode=normalization_mode,
+        original_text=original_text,
+    )
     corrected = loop_result.corrected_text
 
     if not corrected.strip():
@@ -149,10 +210,64 @@ def _correction_stage(transcript, domain_mode="meeting") -> StageResult:
         meta={
             "attempts": loop_result.attempts,
             "feedback_history": loop_result.feedback_history,
+            "normalized_text": loop_result.normalized_text,
         },
         validation=loop_result.validation,
         errors=loop_result.errors,
     )
+
+
+def _normalization_stage(transcript, source_language="en", is_mixed=False, normalization_mode="hindi"):
+    text = (transcript or "").strip()
+    if not text:
+        return ""
+    if source_language == "hi" and is_mixed:
+        return normalize_code_switch(text, mode=normalization_mode or "hindi")
+    return text
+
+
+def _translation_stage(corrected_transcript, source_language, validation, errors):
+    source = (source_language or "unknown").strip().lower()
+    base_text = (corrected_transcript or "").strip()
+    transcripts = {source: base_text} if source and source != "unknown" and base_text else {}
+
+    if not base_text:
+        return {
+            "hindi": "",
+            "english": "",
+            "tamil": "",
+            "telugu": "",
+        }
+
+    if source == "hi":
+        try:
+            translated = build_multilingual_transcripts(base_text, original_language=source, targets=("en", "ta", "te"))
+        except Exception as exc:
+            errors.append(f"Translation issue: {exc}")
+            translated = {"hi": base_text, "en": "", "ta": "", "te": ""}
+    else:
+        translated = transcripts
+        translated.setdefault("en", base_text if source == "en" else "")
+        translated.setdefault("hi", base_text if source == "hi" else "")
+        translated.setdefault("ta", base_text if source == "ta" else "")
+        translated.setdefault("te", base_text if source == "te" else "")
+
+    # Translation must happen after correction and validation. We only fan out the outputs here.
+    return {
+        "hindi": translated.get("hi", base_text if source == "hi" else ""),
+        "english": translated.get("en", base_text if source == "en" else ""),
+        "tamil": translated.get("ta", base_text if source == "ta" else ""),
+        "telugu": translated.get("te", base_text if source == "te" else ""),
+    }
+
+
+def _subtitle_stage(transcripts, segments):
+    hindi_text = (transcripts or {}).get("hindi", "")
+    english_text = (transcripts or {}).get("english", "")
+    return {
+        "hi": build_srt_from_segments(hindi_text, segments),
+        "en": build_srt_from_segments(english_text, segments),
+    }
 
 
 def _format_timestamp(seconds):

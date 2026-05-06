@@ -94,10 +94,15 @@ class CorrectionAgent:
     Fast transcript cleanup using Gemini.
     """
 
-    def correct_text(self, transcript, domain_mode="meeting", feedback=None):
-        return self.correct_text_with_result(transcript, domain_mode=domain_mode, feedback=feedback).text
+    def correct_text(self, transcript, domain_mode="meeting", feedback=None, source_language="en"):
+        return self.correct_text_with_result(
+            transcript,
+            domain_mode=domain_mode,
+            feedback=feedback,
+            source_language=source_language,
+        ).text
 
-    def correct_text_with_result(self, transcript, domain_mode="meeting", feedback=None):
+    def correct_text_with_result(self, transcript, domain_mode="meeting", feedback=None, source_language="en"):
         cleaned_input = _basic_cleanup(transcript)
         if not cleaned_input:
             return CorrectionResult(text="")
@@ -173,12 +178,27 @@ class CorrectionAgent:
 
         feedback_guidance = format_feedback()
 
+        source_language = (source_language or "en").strip().lower()
+
         def build_prompt(text, chunk_mode=False):
             chunk_rule = (
                 "This is one chunk from a longer transcript. Correct every line in this chunk and return every speaker turn."
                 if chunk_mode
                 else "Return the full corrected transcript from beginning to end."
             )
+            language_rules = """
+LANGUAGE RULES:
+- The input transcript is in Hindi and may contain natural English code-mixing.
+- Improve grammar, punctuation, and readability in Hindi.
+- Preserve the original meaning and conversational tone.
+- Do not translate the transcript into English or any other language.
+- Keep the final output in Hindi, while preserving natural proper nouns or mixed-language terms when needed.
+""".strip() if source_language == "hi" else f"""
+LANGUAGE RULES:
+- Preserve the transcript in its original language: {source_language}.
+- Do not translate the transcript into another language.
+- Only improve grammar, punctuation, readability, and formatting.
+""".strip()
             refinement_mode = bool(feedback_guidance.strip())
             refinement_rules = """
 REFINEMENT MODE:
@@ -221,10 +241,11 @@ INSTRUCTIONS:
 IMPORTANT RULES:
 - Maintain all original information.
 - Do not add new information.
-- Do not over-polish into perfect English.
+- Do not over-polish into formal written language.
 - Keep it sounding like real spoken conversation.
 - Return only the corrected transcript.
 - {chunk_rule}
+{language_rules}
 {feedback_guidance}
 {refinement_rules}
 
@@ -284,14 +305,24 @@ Transcript:
             )
 
 
-def correct_text(transcript, domain_mode="meeting", feedback=None):
+def correct_text(transcript, domain_mode="meeting", feedback=None, source_language="en"):
     agent = CorrectionAgent()
-    return agent.correct_text(transcript, domain_mode=domain_mode, feedback=feedback)
+    return agent.correct_text(
+        transcript,
+        domain_mode=domain_mode,
+        feedback=feedback,
+        source_language=source_language,
+    )
 
 
-def correct_text_with_result(transcript, domain_mode="meeting", feedback=None):
+def correct_text_with_result(transcript, domain_mode="meeting", feedback=None, source_language="en"):
     agent = CorrectionAgent()
-    return agent.correct_text_with_result(transcript, domain_mode=domain_mode, feedback=feedback)
+    return agent.correct_text_with_result(
+        transcript,
+        domain_mode=domain_mode,
+        feedback=feedback,
+        source_language=source_language,
+    )
 
 
 if __name__ == "__main__":

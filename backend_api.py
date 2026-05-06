@@ -21,8 +21,9 @@ from config import (
 from mom_agent import generate_minutes_of_meeting
 from pipeline import run_transcription_pipeline
 from pipeline_controller import run_feedback_correction_loop
+from services.translation_service import build_multilingual_transcripts, translate_transcript
 from simplification_agent import simplify_transcript
-from translation_agent import LANGUAGE_SPECS, translate_text
+from translation_agent import LANGUAGE_SPECS
 from tts_agent import text_to_speech_file
 from validation_agent import validate_transcript_detailed
 from websocket import register_live_routes
@@ -43,8 +44,15 @@ app.add_middleware(
 
 
 class TranscriptRequest(BaseModel):
-    corrected_transcript: str
+    corrected_transcript: str = ""
+    raw_transcript: str = ""
+    text: str = ""
+    source_language: str = "en"
+    source_lang: str = "en"
     target_language: str = "hi"
+    target_lang: str = "hi"
+    normalization_mode: str = "hindi"
+    is_mixed: bool = False
     summary_style: str = "concise"
     domain_mode: str = DEFAULT_DOMAIN_MODE
 
@@ -59,6 +67,12 @@ class RefineRequest(TranscriptRequest):
     suggestions: list[str] = Field(default_factory=list)
 
 
+class TranslationRequest(BaseModel):
+    text: str
+    source_lang: str = "hi"
+    target_lang: str = "en"
+
+
 def _public_audio_url(audio_path: str) -> str:
     path = Path(audio_path)
     return f"/api/media/audio/{path.name}"
@@ -68,7 +82,10 @@ def _serialize_validation(result):
     return {
         "isValid": result.is_valid,
         "verdict": result.verdict,
+        "verdictDisplay": str(result.verdict or "").upper(),
         "confidenceScore": result.confidence_score,
+        "scores": result.scores,
+        "total": result.total,
         "summary": result.summary,
         "issues": result.issues,
         "strengths": result.strengths,
@@ -79,6 +96,26 @@ def _serialize_validation(result):
         "validator": result.validator,
         "metricScores": result.metric_scores,
         "criticalIssues": result.critical_issues,
+    }
+
+
+def _resolve_transcript_text(payload: TranscriptRequest) -> str:
+    return (payload.corrected_transcript or payload.text or "").strip()
+
+
+def _resolve_source_language(payload: TranscriptRequest) -> str:
+    return (payload.source_language or payload.source_lang or "en").strip().lower()
+
+
+def _database_record(result):
+    return {
+        "original_language": result.original_language,
+        "is_mixed": result.is_mixed,
+        "normalization_mode": result.normalization_mode,
+        "raw_transcript": result.raw_transcript,
+        "normalized_transcript": result.normalized_transcript,
+        "corrected_transcript": result.corrected_transcript,
+        "transcripts": result.transcripts,
     }
 
 
@@ -104,12 +141,12 @@ def health():
     }
 
 
-@app.post("/api/process")
-async def process(
+async def _process_upload(
     file: UploadFile = File(...),
     speaker_count: str = Form("auto"),
     transcription_language: str = Form(DEFAULT_TRANSCRIPTION_LANGUAGE),
     domain_mode: str = Form(DEFAULT_DOMAIN_MODE),
+    normalization_mode: str = Form("hindi"),
 ):
     suffix = Path(file.filename or "upload.bin").suffix or ".bin"
     upload_path = TEMP_DIR / f"upload_{uuid.uuid4().hex}{suffix}"
@@ -123,44 +160,90 @@ async def process(
             speaker_count,
             transcription_language=transcription_language,
             domain_mode=domain_mode,
+            normalization_mode=normalization_mode,
         )
         return {
             "ok": result.ok,
+            "language": result.detected_language,
+            "original_language": result.original_language,
+            "is_mixed": result.is_mixed,
+            "normalization_mode": result.normalization_mode,
+            "raw_transcript": result.raw_transcript,
+            "normalized_transcript": result.normalized_transcript,
+            "corrected_transcript": result.corrected_transcript,
+            "isMixed": result.is_mixed,
             "rawTranscript": result.raw_transcript,
+            "normalizedTranscript": result.normalized_transcript,
             "speakerTranscript": result.speaker_transcript,
             "correctedTranscript": result.corrected_transcript,
+            "detectedLanguage": result.detected_language,
+            "originalLanguage": result.original_language,
+            "transcripts": result.transcripts,
+            "subtitles": result.subtitles,
             "timestampedTranscript": result.timestamped_transcript,
             "segments": result.segments,
             "validation": _serialize_validation(result.validation),
             "errors": result.errors,
             "audioQuality": result.audio_quality,
+            "databaseRecord": _database_record(result),
             "meta": {
                 "speakerCount": speaker_count,
                 "sourceFilename": file.filename,
                 "transcriptionLanguage": transcription_language,
                 "domainMode": domain_mode,
+                "detectedLanguage": result.detected_language,
+                "originalLanguage": result.original_language,
+                "isMixed": result.is_mixed,
+                "normalizationMode": result.normalization_mode,
             },
         }
     finally:
         await file.close()
 
 
+@app.post("/api/process")
+async def process(
+    file: UploadFile = File(...),
+    speaker_count: str = Form("auto"),
+    transcription_language: str = Form(DEFAULT_TRANSCRIPTION_LANGUAGE),
+    domain_mode: str = Form(DEFAULT_DOMAIN_MODE),
+    normalization_mode: str = Form("hindi"),
+):
+    return await _process_upload(file, speaker_count, transcription_language, domain_mode, normalization_mode)
+
+
+@app.post("/api/transcribe")
+async def transcribe(
+    file: UploadFile = File(...),
+    speaker_count: str = Form("auto"),
+    transcription_language: str = Form(DEFAULT_TRANSCRIPTION_LANGUAGE),
+    domain_mode: str = Form(DEFAULT_DOMAIN_MODE),
+    normalization_mode: str = Form("hindi"),
+):
+    return await _process_upload(file, speaker_count, transcription_language, domain_mode, normalization_mode)
+
+
 @app.post("/api/translate")
-def translate(payload: TranscriptRequest):
+def translate(payload: TranslationRequest):
     if not GEMINI_API_KEY:
         raise HTTPException(
             status_code=503,
             detail="Gemini is not configured on the backend. Set GEMINI_API_KEY and restart the backend.",
         )
 
-    transcript = (payload.corrected_transcript or "").strip()
-    target_language = (payload.target_language or "hi").strip().lower()
+    transcript = (payload.text or "").strip()
+    source_language = (payload.source_lang or "hi").strip().lower()
+    target_language = (payload.target_lang or "en").strip().lower()
     if not transcript:
         raise HTTPException(status_code=400, detail="No transcript provided for translation.")
     if target_language not in LANGUAGE_SPECS:
         raise HTTPException(status_code=400, detail="Unsupported translation language.")
 
-    translated_text = translate_text(transcript, target_language=target_language)
+    translated_text = translate_transcript(
+        transcript,
+        source_lang=source_language,
+        target_lang=target_language,
+    )
     if not translated_text:
         raise HTTPException(
             status_code=502,
@@ -170,6 +253,7 @@ def translate(payload: TranscriptRequest):
     return {
         "ok": True,
         "translatedText": translated_text,
+        "sourceLanguage": source_language,
         "targetLanguage": target_language,
         "message": "Translation ready.",
     }
@@ -177,11 +261,18 @@ def translate(payload: TranscriptRequest):
 
 @app.post("/api/validate")
 def validate(payload: TranscriptRequest):
-    transcript = (payload.corrected_transcript or "").strip()
+    transcript = _resolve_transcript_text(payload)
     if not transcript:
         raise HTTPException(status_code=400, detail="No transcript provided for validation.")
 
-    validation = validate_transcript_detailed(transcript, domain_mode=payload.domain_mode)
+    validation = validate_transcript_detailed(
+        transcript,
+        domain_mode=payload.domain_mode,
+        source_language=_resolve_source_language(payload),
+        normalization_mode=payload.normalization_mode,
+        is_mixed=payload.is_mixed,
+        original_text=payload.raw_transcript,
+    )
     return {
         "ok": validation.is_valid,
         "validation": _serialize_validation(validation),
@@ -190,7 +281,7 @@ def validate(payload: TranscriptRequest):
 
 @app.post("/api/refine")
 def refine(payload: RefineRequest):
-    transcript = (payload.corrected_transcript or "").strip()
+    transcript = _resolve_transcript_text(payload)
     if not transcript:
         raise HTTPException(status_code=400, detail="No transcript provided for refinement.")
     if not GEMINI_API_KEY:
@@ -199,14 +290,38 @@ def refine(payload: RefineRequest):
             detail="Gemini is not configured on the backend. Set GEMINI_API_KEY and restart the backend.",
         )
 
-    baseline_validation = validate_transcript_detailed(transcript, domain_mode=payload.domain_mode)
-    loop_result = run_feedback_correction_loop(transcript, domain_mode=payload.domain_mode, max_retries=1)
+    source_language = _resolve_source_language(payload)
+    baseline_validation = validate_transcript_detailed(
+        transcript,
+        domain_mode=payload.domain_mode,
+        source_language=source_language,
+        normalization_mode=payload.normalization_mode,
+        is_mixed=payload.is_mixed,
+        original_text=payload.raw_transcript or transcript,
+    )
+    loop_result = run_feedback_correction_loop(
+        transcript,
+        domain_mode=payload.domain_mode,
+        max_retries=1,
+        source_language=source_language,
+        is_mixed=payload.is_mixed,
+        normalization_mode=payload.normalization_mode,
+        original_text=payload.raw_transcript or transcript,
+    )
     refined_text = (loop_result.corrected_text or "").strip() or transcript
-    validation = loop_result.validation or validate_transcript_detailed(refined_text, domain_mode=payload.domain_mode)
+    validation = loop_result.validation or validate_transcript_detailed(
+        refined_text,
+        domain_mode=payload.domain_mode,
+        source_language=source_language,
+        normalization_mode=payload.normalization_mode,
+        is_mixed=payload.is_mixed,
+        original_text=payload.raw_transcript or transcript,
+    )
 
     if validation.confidence_score < baseline_validation.confidence_score:
         return {
             "ok": baseline_validation.is_valid,
+            "normalizedTranscript": loop_result.normalized_text or transcript,
             "correctedTranscript": transcript,
             "validation": _serialize_validation(baseline_validation),
             "message": "Refinement did not improve the transcript, so the previous version was kept.",
@@ -214,6 +329,7 @@ def refine(payload: RefineRequest):
 
     return {
         "ok": validation.is_valid,
+        "normalizedTranscript": loop_result.normalized_text or transcript,
         "correctedTranscript": refined_text,
         "validation": _serialize_validation(validation),
         "message": "Transcript refined with validation feedback.",
@@ -222,27 +338,52 @@ def refine(payload: RefineRequest):
 
 @app.post("/api/minutes")
 def minutes(payload: TranscriptRequest):
-    transcript = (payload.corrected_transcript or "").strip()
+    transcript = _resolve_transcript_text(payload)
     if not transcript:
         raise HTTPException(status_code=400, detail="No transcript provided for meeting notes.")
 
-    mom, key_points, decisions, action_items = generate_minutes_of_meeting(
+    source_language = _resolve_source_language(payload)
+    result = generate_minutes_of_meeting(
         transcript,
         summary_style=payload.summary_style,
         domain_mode=payload.domain_mode,
+        source_language=source_language,
     )
-    return {
-        "ok": True,
-        "minutes": mom,
-        "keyPoints": key_points,
-        "decisions": decisions,
-        "actionItems": action_items,
-    }
+    try:
+        multilingual_transcripts = build_multilingual_transcripts(transcript, original_language=source_language)
+    except Exception:
+        multilingual_transcripts = {"en": transcript if source_language == "en" else ""}
+    english_source = multilingual_transcripts.get("en", "")
+    english_minutes = (
+        generate_minutes_of_meeting(
+            english_source,
+            summary_style=payload.summary_style,
+            domain_mode=payload.domain_mode,
+            source_language="en",
+        ).to_dict()
+        if english_source
+        else {}
+    )
+
+    payload_data = result.to_dict()
+    source_language_minutes = dict(payload_data)
+    payload_data.update(
+        {
+            "ok": True,
+            "correctedTranscript": transcript,
+            "minutesByLanguage": {
+                source_language: source_language_minutes,
+                "en": english_minutes,
+            },
+            "englishMinutes": english_minutes,
+        }
+    )
+    return payload_data
 
 
 @app.post("/api/simplify")
 def simplify(payload: TranscriptRequest):
-    transcript = (payload.corrected_transcript or "").strip()
+    transcript = _resolve_transcript_text(payload)
     if not transcript:
         raise HTTPException(status_code=400, detail="No transcript provided for simplification.")
     if not GEMINI_API_KEY:

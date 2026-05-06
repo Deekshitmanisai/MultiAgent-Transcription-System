@@ -4,6 +4,7 @@ from gemini_service import generate_text
 
 
 LANGUAGE_SPECS = {
+    "en": {"name": "English", "script": "Latin"},
     "hi": {"name": "Hindi", "script": "Devanagari"},
     "ta": {"name": "Tamil", "script": "Tamil"},
     "te": {"name": "Telugu", "script": "Telugu"},
@@ -19,6 +20,7 @@ def _extract_script_text(text, lang_code):
         "Tamil": [(0x0B80, 0x0BFF)],
         "Telugu": [(0x0C00, 0x0C7F)],
         "Kannada": [(0x0C80, 0x0CFF)],
+        "Latin": [(0x0041, 0x005A), (0x0061, 0x007A)],
     }
     allowed_ranges = ranges.get(spec["script"], [])
     kept = []
@@ -26,7 +28,7 @@ def _extract_script_text(text, lang_code):
         code = ord(ch)
         if any(start <= code <= end for start, end in allowed_ranges):
             kept.append(ch)
-        elif kept and ch in (" ", "\n", "\t", ".", ",", "!", "?", "-", ":", ";", "(", ")"):
+        elif kept and (ch.isdigit() or ch in (" ", "\n", "\t", ".", ",", "!", "?", "-", ":", ";", "(", ")", "'", "\"")):
             kept.append(ch)
     cleaned = "".join(kept)
     cleaned = "\n".join([line.strip() for line in cleaned.splitlines() if line.strip()])
@@ -36,18 +38,21 @@ def _extract_script_text(text, lang_code):
 
 
 class TranslationAgent:
-    def translate(self, text, target_language="hi"):
+    def translate(self, text, source_language="auto", target_language="hi"):
         source_text = (text or "").strip()
         if not source_text:
             return ""
 
         spec = LANGUAGE_SPECS.get(target_language, LANGUAGE_SPECS["hi"])
+        source_spec = LANGUAGE_SPECS.get(source_language, {"name": "the source language"})
         prompt = f"""
-Translate the following text into {spec["name"]}.
+Translate the following text from {source_spec["name"]} into {spec["name"]}.
 
 Rules:
 - Output only {spec["script"]} script.
-- Do not include English, transliteration, quotes, or explanations.
+- Do not add explanations, headers, or notes.
+- Preserve speaker labels such as Person 1, Person 2, etc.
+- Keep mixed-language proper nouns naturally when translation would sound unnatural.
 - Keep the meaning faithful and natural.
 
 Text:
@@ -68,9 +73,9 @@ Text:
         return _extract_script_text(response_text, target_language)
 
 
-def translate_text(text, target_language="hi"):
+def translate_text(text, source_language="auto", target_language="hi"):
     agent = TranslationAgent()
-    return agent.translate(text, target_language=target_language)
+    return agent.translate(text, source_language=source_language, target_language=target_language)
 
 
 def translate_to_hindi(text):

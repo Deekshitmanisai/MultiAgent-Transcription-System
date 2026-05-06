@@ -2,10 +2,13 @@ from collections import deque
 from dataclasses import dataclass
 from datetime import datetime
 
-import numpy as np
-
 from gemini_service import generate_text
-from speaker_diarization import _extract_segment_features, _turn_taking_speakers
+from speaker_diarization import (
+    _build_segment_profile,
+    _profile_distance,
+    _reindex_speakers_by_first_appearance,
+    _turn_taking_speakers,
+)
 from speech_to_text import SpeechToTextAgent
 
 
@@ -18,7 +21,7 @@ class LiveChunkResult:
 
 
 class OnlineSpeakerTracker:
-    def __init__(self, *, sample_rate=16000, max_speakers=6, distance_threshold=115.0):
+    def __init__(self, *, sample_rate=16000, max_speakers=6, distance_threshold=0.32):
         self.sample_rate = sample_rate
         self.max_speakers = max_speakers
         self.distance_threshold = float(distance_threshold)
@@ -43,8 +46,8 @@ class OnlineSpeakerTracker:
             enriched["_pause_before"] = pause_before
             last_end = float(segment.get("end", start))
 
-            feature_vector = _extract_segment_features(audio_float32, self.sample_rate, enriched, librosa)
-            speaker_id = self._match_speaker(feature_vector) if feature_vector is not None else None
+            profile = _build_segment_profile(audio_float32, self.sample_rate, enriched, librosa)
+            speaker_id = self._match_speaker(profile) if profile is not None else None
             if speaker_id is None:
                 enriched["speaker"] = int(segment.get("speaker", 1))
             else:
@@ -52,28 +55,47 @@ class OnlineSpeakerTracker:
             assigned_segments.append(enriched)
 
         if len({segment["speaker"] for segment in assigned_segments}) == 1 and len(assigned_segments) >= 2:
-            return _turn_taking_speakers(segments)
+            return _reindex_speakers_by_first_appearance(_turn_taking_speakers(segments))
 
-        return assigned_segments
+        return _reindex_speakers_by_first_appearance(assigned_segments)
 
-    def _match_speaker(self, feature_vector):
-        if feature_vector is None:
+    def _match_speaker(self, profile):
+        if profile is None:
             return None
 
+        feature_vector = profile["vector"]
+
         if not self._profiles:
-            self._profiles.append({"speaker_id": 1, "centroid": feature_vector.copy(), "count": 1})
+            self._profiles.append(
+                {
+                    "speaker_id": 1,
+                    "centroid": feature_vector.copy(),
+                    "pitch_mean": float(profile.get("pitch_mean", 0.0) or 0.0),
+                    "voiced_ratio": float(profile.get("voiced_ratio", 0.0) or 0.0),
+                    "channel_balance": float(profile.get("channel_balance", 0.0) or 0.0),
+                    "count": 1,
+                }
+            )
             return 1
 
         distances = []
-        for profile in self._profiles:
-            centroid = profile["centroid"]
-            distance = float(np.linalg.norm(feature_vector - centroid))
-            distances.append((distance, profile))
+        for speaker_profile in self._profiles:
+            distance = _profile_distance(feature_vector, speaker_profile, profile_meta=profile)
+            distances.append((distance, speaker_profile))
 
         best_distance, best_profile = min(distances, key=lambda item: item[0])
         if best_distance <= self.distance_threshold:
             count = best_profile["count"]
             best_profile["centroid"] = (best_profile["centroid"] * count + feature_vector) / float(count + 1)
+            best_profile["pitch_mean"] = (
+                (best_profile["pitch_mean"] * count) + float(profile.get("pitch_mean", 0.0) or 0.0)
+            ) / float(count + 1)
+            best_profile["voiced_ratio"] = (
+                (best_profile["voiced_ratio"] * count) + float(profile.get("voiced_ratio", 0.0) or 0.0)
+            ) / float(count + 1)
+            best_profile["channel_balance"] = (
+                (best_profile["channel_balance"] * count) + float(profile.get("channel_balance", 0.0) or 0.0)
+            ) / float(count + 1)
             best_profile["count"] = count + 1
             return int(best_profile["speaker_id"])
 
@@ -83,6 +105,9 @@ class OnlineSpeakerTracker:
                 {
                     "speaker_id": new_speaker_id,
                     "centroid": feature_vector.copy(),
+                    "pitch_mean": float(profile.get("pitch_mean", 0.0) or 0.0),
+                    "voiced_ratio": float(profile.get("voiced_ratio", 0.0) or 0.0),
+                    "channel_balance": float(profile.get("channel_balance", 0.0) or 0.0),
                     "count": 1,
                 }
             )
@@ -90,6 +115,15 @@ class OnlineSpeakerTracker:
 
         count = best_profile["count"]
         best_profile["centroid"] = (best_profile["centroid"] * count + feature_vector) / float(count + 1)
+        best_profile["pitch_mean"] = (
+            (best_profile["pitch_mean"] * count) + float(profile.get("pitch_mean", 0.0) or 0.0)
+        ) / float(count + 1)
+        best_profile["voiced_ratio"] = (
+            (best_profile["voiced_ratio"] * count) + float(profile.get("voiced_ratio", 0.0) or 0.0)
+        ) / float(count + 1)
+        best_profile["channel_balance"] = (
+            (best_profile["channel_balance"] * count) + float(profile.get("channel_balance", 0.0) or 0.0)
+        ) / float(count + 1)
         best_profile["count"] = count + 1
         return int(best_profile["speaker_id"])
 
@@ -106,9 +140,10 @@ def _format_speaker_transcript(segments):
 
 
 class LiveChunkProcessor:
-    def __init__(self, *, language="auto", model_size=None):
+    def __init__(self, *, language="auto", model_size=None, enable_chunk_correction=False):
         self.language = language
         self.agent = SpeechToTextAgent(model_size=model_size) if model_size else SpeechToTextAgent()
+        self.enable_chunk_correction = bool(enable_chunk_correction)
         self.context = deque(maxlen=2)
         self.collected_english = []
         self.speaker_tracker = OnlineSpeakerTracker()
@@ -130,7 +165,7 @@ class LiveChunkProcessor:
         if not speaker_chunk_text:
             return None
 
-        corrected = self._correct_with_context(speaker_chunk_text)
+        corrected = self._correct_with_context(speaker_chunk_text) if self.enable_chunk_correction else speaker_chunk_text
 
         self.context.append(corrected)
         self.collected_english.append(corrected)

@@ -9,8 +9,11 @@ const LIVE_SOURCE_OPTIONS = [
 
 
 function toWebSocketUrl(apiBase, source) {
-  if (!apiBase) return "ws://127.0.0.1:8000/live";
   const suffix = `/live?source=${encodeURIComponent(source || "system")}`;
+  if (!apiBase) {
+    const protocol = window.location.protocol === "https:" ? "wss:" : "ws:";
+    return `${protocol}//${window.location.host}${suffix}`;
+  }
   if (apiBase.startsWith("https://")) return apiBase.replace("https://", "wss://") + suffix;
   if (apiBase.startsWith("http://")) return apiBase.replace("http://", "ws://") + suffix;
   return `${apiBase}${suffix}`;
@@ -26,10 +29,11 @@ function formatChunkLine(chunk) {
 export default function LiveMode({ apiBase, isAvailable }) {
   const [isRunning, setIsRunning] = useState(false);
   const [status, setStatus] = useState("Ready to start live transcription.");
-  const [source, setSource] = useState("both");
+  const [source, setSource] = useState("microphone");
   const [englishChunks, setEnglishChunks] = useState([]);
   const [summary, setSummary] = useState("");
   const socketRef = useRef(null);
+  const receivedServerMessageRef = useRef(false);
 
   useEffect(() => {
     return () => {
@@ -48,6 +52,7 @@ export default function LiveMode({ apiBase, isAvailable }) {
     setEnglishChunks([]);
     setSummary("");
     setStatus("Connecting to live transcription...");
+    receivedServerMessageRef.current = false;
 
     const socket = new WebSocket(toWebSocketUrl(apiBase, source));
     socketRef.current = socket;
@@ -58,6 +63,7 @@ export default function LiveMode({ apiBase, isAvailable }) {
     };
 
     socket.onmessage = (event) => {
+      receivedServerMessageRef.current = true;
       const payload = JSON.parse(event.data);
       if (payload.type === "status") {
         setStatus(payload.message || "Live status updated.");
@@ -80,7 +86,13 @@ export default function LiveMode({ apiBase, isAvailable }) {
     };
 
     socket.onerror = () => {
-      setStatus("Live transcription connection failed.");
+      if (!receivedServerMessageRef.current) {
+        setStatus(
+          source === "both"
+            ? "Live transcription connection failed. Try Microphone Only or System Audio."
+            : "Live transcription connection failed."
+        );
+      }
       setIsRunning(false);
     };
 
@@ -88,7 +100,11 @@ export default function LiveMode({ apiBase, isAvailable }) {
       setIsRunning(false);
       socketRef.current = null;
       setStatus((current) =>
-        current === "Live Transcription Running..." ? "Live transcription stopped." : current
+        current === "Live Transcription Running..."
+          ? "Live transcription stopped."
+          : current === "Connecting to live transcription..." && source === "both"
+            ? "Live mode closed while opening. Try Microphone Only or System Audio."
+            : current
       );
     };
   }

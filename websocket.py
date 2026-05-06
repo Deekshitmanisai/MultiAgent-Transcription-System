@@ -9,8 +9,8 @@ from live_pipeline import LiveChunkProcessor
 class LiveSession:
     def __init__(self, websocket: WebSocket, *, source=SOURCE_SYSTEM):
         self.websocket = websocket
-        self.queue = asyncio.Queue(maxsize=3)
-        self.processor = LiveChunkProcessor()
+        self.queue = asyncio.Queue(maxsize=5)
+        self.processor = LiveChunkProcessor(model_size="tiny", enable_chunk_correction=False)
         self.capture = LiveAudioCapture(asyncio.get_running_loop(), self.queue, source=source)
         self.stop_requested = asyncio.Event()
 

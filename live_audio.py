@@ -33,7 +33,7 @@ class LiveAudioCapture:
         source=SOURCE_SYSTEM,
         sample_rate=16000,
         channels=1,
-        chunk_seconds=5,
+        chunk_seconds=3,
     ):
         self.loop = loop
         self.queue = queue

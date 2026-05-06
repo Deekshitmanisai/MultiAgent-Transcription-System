@@ -1,7 +1,12 @@
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import LiveMode from "./LiveMode";
 
-const API_BASE = import.meta.env.VITE_API_BASE_URL || "http://127.0.0.1:8000";
+const DEFAULT_API_BASE = `${window.location.protocol}//${window.location.hostname}:8000`;
+const API_BASE = (import.meta.env.VITE_API_BASE_URL || DEFAULT_API_BASE).replace(/\/$/, "");
+
+function apiUrl(path) {
+  return `${API_BASE}${path}`;
+}
 const LANGUAGE_OPTIONS = [
   { code: "auto", label: "Auto Detect" },
   { code: "en", label: "English" },
@@ -12,9 +17,9 @@ const LANGUAGE_OPTIONS = [
 ];
 const TRANSLATION_OPTIONS = [
   { code: "hi", label: "Hindi" },
-  { code: "te", label: "Telugu" },
-  { code: "kn", label: "Kannada" },
+  { code: "en", label: "English" },
   { code: "ta", label: "Tamil" },
+  { code: "te", label: "Telugu" },
 ];
 const DOMAIN_OPTIONS = [
   { code: "meeting", label: "Meeting" },
@@ -28,6 +33,11 @@ const SUMMARY_STYLES = [
   { code: "actions_only", label: "Actions Only" },
   { code: "executive", label: "Executive" },
 ];
+const NORMALIZATION_OPTIONS = [
+  { code: "hindi", label: "Hindi normalized" },
+  { code: "english", label: "English normalized" },
+  { code: "keep-mixed", label: "Keep mixed" },
+];
 const tabs = [
   { id: "transcript", label: "Transcript Workspace" },
   { id: "compare", label: "Comparison" },
@@ -39,14 +49,31 @@ const tabs = [
 
 const initialResult = {
   rawTranscript: "",
+  normalizedTranscript: "",
   speakerTranscript: "",
   correctedTranscript: "",
+  detectedLanguage: "unknown",
+  originalLanguage: "unknown",
+  isMixed: false,
+  normalizationMode: "hindi",
+  transcripts: {
+    hindi: "",
+    english: "",
+    tamil: "",
+    telugu: "",
+  },
+  subtitles: {
+    hi: "",
+    en: "",
+  },
   timestampedTranscript: "",
   segments: [],
   validation: {
     isValid: false,
     verdict: "unavailable",
     confidenceScore: 0,
+    scores: {},
+    total: 0,
     summary: "",
     issues: [],
     strengths: [],
@@ -67,9 +94,11 @@ function App() {
   const [speakerCount, setSpeakerCount] = useState("auto");
   const [selectedTab, setSelectedTab] = useState("transcript");
   const [videoFile, setVideoFile] = useState(null);
+  const [isDraggingFile, setIsDraggingFile] = useState(false);
   const [status, setStatus] = useState("Waiting for input.");
-  const [selectedLanguage, setSelectedLanguage] = useState("hi");
+  const [selectedLanguage, setSelectedLanguage] = useState("en");
   const [transcriptionLanguage, setTranscriptionLanguage] = useState("auto");
+  const [normalizationMode, setNormalizationMode] = useState("hindi");
   const [domainMode, setDomainMode] = useState("meeting");
   const [summaryStyle, setSummaryStyle] = useState("concise");
   const [searchQuery, setSearchQuery] = useState("");
@@ -83,22 +112,76 @@ function App() {
   const [result, setResult] = useState(initialResult);
   const [speakerAliases, setSpeakerAliases] = useState({});
   const [minutes, setMinutes] = useState("");
+  const [englishMinutes, setEnglishMinutes] = useState("");
   const [keyPoints, setKeyPoints] = useState("");
   const [decisions, setDecisions] = useState("");
   const [actionItems, setActionItems] = useState("");
+  const [meetingSummary, setMeetingSummary] = useState("");
+  const [keyDiscussions, setKeyDiscussions] = useState([]);
+  const [deadlines, setDeadlines] = useState([]);
+  const [importantHighlights, setImportantHighlights] = useState([]);
+  const [parsedActionItems, setParsedActionItems] = useState([]);
+  const [parsedDecisions, setParsedDecisions] = useState([]);
   const [simplifiedText, setSimplifiedText] = useState("");
   const [translatedText, setTranslatedText] = useState("");
   const [translationStatus, setTranslationStatus] = useState("Translation and voice status will appear here.");
   const [englishAudioUrl, setEnglishAudioUrl] = useState("");
   const [targetAudioUrl, setTargetAudioUrl] = useState("");
+  const fileInputRef = useRef(null);
 
   const hasTranscript = useMemo(
     () => Boolean(result.correctedTranscript.trim()),
     [result.correctedTranscript]
   );
+  const hasMeetingAnalysis = useMemo(
+    () =>
+      Boolean(meetingSummary.trim()) ||
+      keyDiscussions.length > 0 ||
+      parsedDecisions.length > 0 ||
+      parsedActionItems.length > 0 ||
+      deadlines.length > 0 ||
+      importantHighlights.length > 0,
+    [deadlines.length, importantHighlights.length, keyDiscussions.length, meetingSummary, parsedActionItems.length, parsedDecisions.length]
+  );
+  const meetingTopic = meetingSummary;
+  const agenda = deadlines.length > 0 ? deadlines.join(", ") : "";
+  const discussionTopics = keyDiscussions.join("\n");
+  const keyTakeaways = keyDiscussions.join("\n");
+  const attendees = [];
+  const qaPairs = [];
+  const nextMeeting = deadlines[0] || "";
+  const resources = [];
+  const sentiment = "neutral";
+  const sentimentScore = 50;
+  const datesMentioned = deadlines;
+  const highlightMomentLines = importantHighlights.map((item) => `${item.type.toUpperCase()}: ${item.text}`);
+  const correctedHindiTranscript =
+    result.transcripts?.hindi || (result.originalLanguage === "hi" ? result.correctedTranscript : "");
+  const englishTranslation =
+    result.transcripts?.english || (result.originalLanguage === "en" ? result.correctedTranscript : "");
+  const speakerAwareCorrectedHindiTranscript = useMemo(
+    () => buildSpeakerAwareTranscript(correctedHindiTranscript, result.segments, speakerAliases),
+    [correctedHindiTranscript, result.segments, speakerAliases]
+  );
+  const speakerAwareEnglishTranslation = useMemo(
+    () => buildSpeakerAwareTranscript(englishTranslation, result.segments, speakerAliases),
+    [englishTranslation, result.segments, speakerAliases]
+  );
+  const selectedTranscriptValue =
+    selectedLanguage === (result.originalLanguage || "en")
+      ? result.correctedTranscript
+      : getTranscriptByCode(result.transcripts, selectedLanguage);
+  const speakerAwareSelectedTranscript = useMemo(
+    () => buildSpeakerAwareTranscript(selectedTranscriptValue, result.segments, speakerAliases),
+    [selectedTranscriptValue, result.segments, speakerAliases]
+  );
+  const availableTranscriptOptions = useMemo(
+    () => TRANSLATION_OPTIONS.filter((option) => Boolean(getTranscriptByCode(result.transcripts, option.code).trim())),
+    [result.transcripts]
+  );
 
   useEffect(() => {
-    fetch(`${API_BASE}/api/health`)
+    fetch(apiUrl("/api/health"))
       .then((response) => response.json())
       .then((payload) => {
         setGeminiConfigured(Boolean(payload.geminiConfigured));
@@ -113,6 +196,39 @@ function App() {
         setLiveModeAvailable(false);
       });
   }, []);
+
+  useEffect(() => {
+    setTranslatedText(getTranscriptByCode(result.transcripts, selectedLanguage));
+  }, [result.transcripts, selectedLanguage]);
+
+  function handlePickedFile(file) {
+    setVideoFile(file || null);
+    setIsDraggingFile(false);
+  }
+
+  function handleClearFile() {
+    setVideoFile(null);
+    setIsDraggingFile(false);
+    if (fileInputRef.current) {
+      fileInputRef.current.value = "";
+    }
+  }
+
+  function handleFileDragOver(event) {
+    event.preventDefault();
+    setIsDraggingFile(true);
+  }
+
+  function handleFileDragLeave(event) {
+    event.preventDefault();
+    setIsDraggingFile(false);
+  }
+
+  function handleFileDrop(event) {
+    event.preventDefault();
+    const file = event.dataTransfer?.files?.[0] || null;
+    handlePickedFile(file);
+  }
 
   useEffect(() => {
     if (!result.segments?.length) {
@@ -149,13 +265,21 @@ function App() {
     formData.append("speaker_count", String(speakerCount));
     formData.append("transcription_language", transcriptionLanguage);
     formData.append("domain_mode", domainMode);
+    formData.append("normalization_mode", normalizationMode);
 
     setIsProcessing(true);
     setStatus("Running full transcription pipeline...");
     setMinutes("");
+    setEnglishMinutes("");
     setKeyPoints("");
     setDecisions("");
     setActionItems("");
+    setMeetingSummary("");
+    setKeyDiscussions([]);
+    setDeadlines([]);
+    setImportantHighlights([]);
+    setParsedActionItems([]);
+    setParsedDecisions([]);
     setSimplifiedText("");
     setTranslatedText("");
     setEnglishAudioUrl("");
@@ -163,12 +287,19 @@ function App() {
     setTranslationStatus("Translation and voice status will appear here.");
 
     try {
-      const response = await fetch(`${API_BASE}/api/process`, { method: "POST", body: formData });
+      const response = await fetch(apiUrl("/api/process"), { method: "POST", body: formData });
       const payload = await checkResponse(response);
       setResult({
         rawTranscript: payload.rawTranscript || "",
+        normalizedTranscript: payload.normalizedTranscript || "",
         speakerTranscript: payload.speakerTranscript || "",
         correctedTranscript: payload.correctedTranscript || "",
+        detectedLanguage: payload.detectedLanguage || "unknown",
+        originalLanguage: payload.originalLanguage || "unknown",
+        isMixed: Boolean(payload.isMixed),
+        normalizationMode: payload.meta?.normalizationMode || normalizationMode,
+        transcripts: normalizeTranscripts(payload.transcripts, payload.correctedTranscript, payload.originalLanguage),
+        subtitles: payload.subtitles || initialResult.subtitles,
         timestampedTranscript: payload.timestampedTranscript || "",
         segments: payload.segments || [],
         validation: normalizeValidation(payload.validation),
@@ -176,9 +307,14 @@ function App() {
         meta: payload.meta || {},
         errors: payload.errors || [],
       });
+      setSelectedLanguage((payload.originalLanguage || "").toLowerCase() === "hi" ? "en" : "en");
 
       if (payload.ok && payload.validation?.isValid) {
-        setStatus("OpenRouter validated the final transcript. It is ready for follow-up actions.");
+        setStatus(
+          payload.isMixed
+            ? "Mixed Hindi-English content was normalized, corrected, and validated. Multilingual outputs are ready."
+            : "OpenRouter validated the final transcript. Multilingual outputs are ready."
+        );
       } else if (payload.ok && payload.validation?.verdict === "review") {
         setStatus("OpenRouter found final-stage quality concerns. Review the transcript before delivery.");
       } else if (payload.ok) {
@@ -201,12 +337,16 @@ function App() {
     setIsValidatingFinal(true);
     setStatus("Running OpenRouter final validation...");
     try {
-      const response = await fetch(`${API_BASE}/api/validate`, {
+      const response = await fetch(apiUrl("/api/validate"), {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
           corrected_transcript: result.correctedTranscript,
+          raw_transcript: result.rawTranscript,
           domain_mode: domainMode,
+          source_language: result.originalLanguage || "en",
+          normalization_mode: result.normalizationMode || normalizationMode,
+          is_mixed: result.isMixed,
         }),
       });
       const payload = await checkResponse(response);
@@ -243,20 +383,33 @@ function App() {
     setIsRefiningWithFeedback(true);
     setStatus("Refining transcript with OpenRouter feedback...");
     try {
-      const response = await fetch(`${API_BASE}/api/refine`, {
+      const response = await fetch(apiUrl("/api/refine"), {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
           corrected_transcript: result.correctedTranscript,
+          raw_transcript: result.rawTranscript,
           domain_mode: domainMode,
           issues,
           suggestions,
+          source_language: result.originalLanguage || "en",
+          normalization_mode: result.normalizationMode || normalizationMode,
+          is_mixed: result.isMixed,
         }),
       });
       const payload = await checkResponse(response);
       setResult((current) => ({
         ...current,
         correctedTranscript: payload.correctedTranscript || current.correctedTranscript,
+        normalizedTranscript: payload.normalizedTranscript || current.normalizedTranscript,
+        transcripts: normalizeTranscripts(
+          {
+            ...current.transcripts,
+            [toTranscriptKey(current.originalLanguage || "en")]: payload.correctedTranscript || current.correctedTranscript,
+          },
+          payload.correctedTranscript || current.correctedTranscript,
+          current.originalLanguage || "en"
+        ),
         validation: normalizeValidation(payload.validation),
       }));
       setSelectedTab("transcript");
@@ -278,20 +431,32 @@ function App() {
 
     setStatus("Generating meeting notes...");
     try {
-      const response = await fetch(`${API_BASE}/api/minutes`, {
+      const response = await fetch(apiUrl("/api/minutes"), {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
           corrected_transcript: result.correctedTranscript,
           summary_style: summaryStyle,
           domain_mode: domainMode,
+          source_language: result.originalLanguage || "en",
         }),
       });
       const payload = await checkResponse(response);
-      setMinutes(payload.minutes || "");
+      setResult((current) => ({
+        ...current,
+        correctedTranscript: payload.correctedTranscript || current.correctedTranscript,
+      }));
+      setMinutes(payload.minutes || payload.meetingSummary || "");
+      setEnglishMinutes(payload.englishMinutes?.minutes || payload.englishMinutes?.meetingSummary || "");
       setKeyPoints(payload.keyPoints || "");
-      setDecisions(payload.decisions || "");
-      setActionItems(payload.actionItems || "");
+      setDecisions(payload.decisionsText || "");
+      setActionItems(payload.actionItemsText || "");
+      setMeetingSummary(payload.meetingSummary || "");
+      setKeyDiscussions(payload.keyDiscussions || []);
+      setDeadlines(payload.deadlines || []);
+      setImportantHighlights(payload.importantHighlights || []);
+      setParsedActionItems(payload.parsedActionItems || []);
+      setParsedDecisions(payload.parsedDecisions || []);
       setSelectedTab("notes");
       setStatus("Meeting notes are ready.");
     } catch (error) {
@@ -305,7 +470,7 @@ function App() {
     setIsSimplifying(true);
     setStatus("Generating simplified explanation...");
     try {
-      const response = await fetch(`${API_BASE}/api/simplify`, {
+      const response = await fetch(apiUrl("/api/simplify"), {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
@@ -330,16 +495,24 @@ function App() {
     setIsTranslating(true);
     setTranslationStatus(`Translating transcript into ${getLanguageLabel(selectedLanguage, TRANSLATION_OPTIONS)}...`);
     try {
-      const response = await fetch(`${API_BASE}/api/translate`, {
+      const response = await fetch(apiUrl("/api/translate"), {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
-          corrected_transcript: result.correctedTranscript,
-          target_language: selectedLanguage,
+          text: correctedHindiTranscript || result.correctedTranscript,
+          source_lang: result.originalLanguage || "en",
+          target_lang: selectedLanguage,
         }),
       });
       const payload = await checkResponse(response);
       setTranslatedText(payload.translatedText || "");
+      setResult((current) => ({
+        ...current,
+        transcripts: {
+          ...current.transcripts,
+          [toTranscriptKey(selectedLanguage)]: payload.translatedText || "",
+        },
+      }));
       setTranslationStatus(payload.message || "Translation ready.");
       setSelectedTab("voice");
     } catch (error) {
@@ -350,18 +523,19 @@ function App() {
   }
 
   async function handleGenerateEnglishVoice() {
-    if (!hasTranscript) return;
+    const englishText = getTranscriptByCode(result.transcripts, "en") || result.correctedTranscript;
+    if (!englishText.trim()) return;
 
     setIsGeneratingEnglish(true);
     setStatus("Generating English voice output...");
     try {
-      const response = await fetch(`${API_BASE}/api/tts`, {
+      const response = await fetch(apiUrl("/api/tts"), {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ text: result.correctedTranscript, lang: "en" }),
+        body: JSON.stringify({ text: englishText, lang: "en" }),
       });
       const payload = await checkResponse(response);
-      setEnglishAudioUrl(`${API_BASE}${payload.audioUrl}`);
+      setEnglishAudioUrl(apiUrl(payload.audioUrl));
       setSelectedTab("voice");
       setStatus("English audio is ready.");
     } catch (error) {
@@ -372,8 +546,9 @@ function App() {
   }
 
   async function handleGenerateTargetVoice() {
-    if (!translatedText.trim()) {
-      setTranslationStatus("Generate translation first.");
+    const targetTranscript = getTranscriptByCode(result.transcripts, selectedLanguage);
+    if (!targetTranscript.trim()) {
+      setTranslationStatus("Generate or load the selected transcript first.");
       return;
     }
 
@@ -381,13 +556,13 @@ function App() {
     const label = getLanguageLabel(selectedLanguage, TRANSLATION_OPTIONS);
     setTranslationStatus(`Generating ${label} voice output...`);
     try {
-      const response = await fetch(`${API_BASE}/api/tts`, {
+      const response = await fetch(apiUrl("/api/tts"), {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ text: translatedText, lang: selectedLanguage }),
+        body: JSON.stringify({ text: targetTranscript, lang: selectedLanguage }),
       });
       const payload = await checkResponse(response);
-      setTargetAudioUrl(`${API_BASE}${payload.audioUrl}`);
+      setTargetAudioUrl(apiUrl(payload.audioUrl));
       setTranslationStatus(`${label} audio is ready.`);
     } catch (error) {
       setTranslationStatus(error.message || "Voice generation failed.");
@@ -407,14 +582,22 @@ function App() {
     const content = [
       "TaaS Transcript Export",
       "",
+      `Detected Language: ${result.detectedLanguage || "unknown"}`,
+      "",
       "Raw Transcript:",
       result.rawTranscript || "N/A",
+      "",
+      "Normalized Transcript:",
+      result.normalizedTranscript || "N/A",
       "",
       "Speaker Transcript:",
       renamedSpeakerTranscript || "N/A",
       "",
       "Final Transcript:",
       result.correctedTranscript || "N/A",
+      "",
+      "English Translation:",
+      englishTranslation || "N/A",
       "",
       "Timestamped Transcript:",
       renamedTimestampedTranscript || "N/A",
@@ -429,6 +612,9 @@ function App() {
       "## Minutes of Meeting",
       minutes || "Not generated",
       "",
+      "## English Minutes of Meeting",
+      englishMinutes || "Not generated",
+      "",
       "## Key Points",
       keyPoints || "Not generated",
       "",
@@ -441,17 +627,29 @@ function App() {
     downloadFile("taas-meeting-notes.md", content, "text/markdown;charset=utf-8");
   }
 
+  function downloadSubtitle(languageCode) {
+    const srt = languageCode === "hi" ? result.subtitles?.hi : result.subtitles?.en;
+    if (!srt?.trim()) return;
+    downloadFile(`taas-${languageCode}.srt`, srt, "application/x-subrip;charset=utf-8");
+  }
+
   function downloadReportJson() {
     const payload = {
       transcript: {
+        original_language: result.originalLanguage,
+        is_mixed: result.isMixed,
+        normalization_mode: result.normalizationMode,
+        transcripts: result.transcripts,
         raw: result.rawTranscript,
+        normalized: result.normalizedTranscript,
         speaker: renamedSpeakerTranscript,
         corrected: result.correctedTranscript,
         timestamped: renamedTimestampedTranscript,
+        subtitles: result.subtitles,
       },
       validation: result.validation,
       audioQuality: result.audioQuality,
-      notes: { minutes, keyPoints, decisions, actionItems },
+      notes: { minutes, englishMinutes, keyPoints, decisions, actionItems },
       meta: { ...result.meta, speakerAliases, summaryStyle, domainMode },
     };
     downloadFile("taas-report.json", JSON.stringify(payload, null, 2), "application/json;charset=utf-8");
@@ -496,6 +694,7 @@ function App() {
     ["Sentence Structure", "sentence_structure"],
     ["Completeness", "completeness"],
     ["Noise Reduction", "noise_reduction"],
+    ["Code-Switch Consistency", "code_switch_consistency"],
   ].map(([label, key]) => ({
     label,
     value: Number(result.validation?.metricScores?.[key] || 0),
@@ -541,18 +740,20 @@ function App() {
       { label: "Raw Words", value: countWords(result.rawTranscript) },
       { label: "Speaker View Words", value: countWords(result.speakerTranscript) },
       { label: "Final Words", value: countWords(result.correctedTranscript) },
+      { label: "English Words", value: countWords(englishTranslation) },
       { label: "Search Matches", value: filteredSegments.length },
     ],
-    [result.rawTranscript, result.speakerTranscript, result.correctedTranscript, filteredSegments.length]
+    [result.rawTranscript, result.speakerTranscript, result.correctedTranscript, englishTranslation, filteredSegments.length]
   );
   const importantMoments = useMemo(() => {
+    if (highlightMomentLines.length > 0) return highlightMomentLines.slice(0, 8);
     const combined = [keyPoints, decisions, actionItems].join("\n");
     return combined
       .split("\n")
       .map((line) => line.trim())
       .filter((line) => line && line !== "- None")
       .slice(0, 8);
-  }, [keyPoints, decisions, actionItems]);
+  }, [actionItems, decisions, highlightMomentLines, keyPoints]);
 
   return (
     <div className="shell">
@@ -589,14 +790,52 @@ function App() {
           </p>
 
           <form onSubmit={handleProcessSubmit} className="stack">
-            <label className="field">
+            <div className="field">
               <span>Meeting video or audio</span>
-              <input
-                type="file"
-                accept="video/*,audio/*"
-                onChange={(event) => setVideoFile(event.target.files?.[0] || null)}
-              />
-            </label>
+              <div
+                className={`file-picker ${videoFile ? "has-file" : ""} ${isDraggingFile ? "is-dragging" : ""}`}
+                onDragOver={handleFileDragOver}
+                onDragLeave={handleFileDragLeave}
+                onDrop={handleFileDrop}
+              >
+                <input
+                  id="meeting-file-input"
+                  ref={fileInputRef}
+                  className="file-input"
+                  type="file"
+                  accept="video/*,audio/*"
+                  onChange={(event) => handlePickedFile(event.target.files?.[0] || null)}
+                />
+                <label htmlFor="meeting-file-input" className="file-picker-surface">
+                  <div className="file-picker-topline">
+                    <span className="file-picker-badge">{videoFile ? "Ready to process" : "Choose file"}</span>
+                    {videoFile ? (
+                      <button
+                        type="button"
+                        className="file-picker-clear"
+                        onClick={(event) => {
+                          event.preventDefault();
+                          handleClearFile();
+                        }}
+                      >
+                        Remove
+                      </button>
+                    ) : null}
+                  </div>
+                  <strong>{videoFile ? videoFile.name : "Drop in a recording or browse from your laptop"}</strong>
+                  <p>
+                    {videoFile
+                      ? `${(videoFile.size / (1024 * 1024)).toFixed(2)} MB`
+                      : "Supports meeting audio and video formats. Clearer recordings give better speaker detection."}
+                  </p>
+                  <div className="file-picker-tags">
+                    <span>Audio</span>
+                    <span>Video</span>
+                    <span>MP3 / WAV / MP4 / M4A</span>
+                  </div>
+                </label>
+              </div>
+            </div>
 
             <label className="field">
               <span>Expected speaker count</span>
@@ -626,6 +865,17 @@ function App() {
               <span>Domain mode</span>
               <select value={domainMode} onChange={(event) => setDomainMode(event.target.value)}>
                 {DOMAIN_OPTIONS.map((option) => (
+                  <option key={option.code} value={option.code}>
+                    {option.label}
+                  </option>
+                ))}
+              </select>
+            </label>
+
+            <label className="field">
+              <span>Code-switch normalization</span>
+              <select value={normalizationMode} onChange={(event) => setNormalizationMode(event.target.value)}>
+                {NORMALIZATION_OPTIONS.map((option) => (
                   <option key={option.code} value={option.code}>
                     {option.label}
                   </option>
@@ -670,7 +920,9 @@ function App() {
             <div className="progress-track">
               <div className={`progress-fill ${qualityClass}`} style={{ width: `${validationConfidence}%` }} />
             </div>
-            <small>Confidence {validationConfidence}/100 | Validator: {validationProviderLabel}</small>
+            <small>
+              Confidence {validationConfidence}/100 | Validator: {validationProviderLabel} | Structured total {result.validation?.total || 0}/60
+            </small>
             <div className="metric-score-list">
               {validationMetricRows.map((metric) => (
                 <div className="metric-score-row" key={metric.label}>
@@ -758,6 +1010,12 @@ function App() {
             <button className="secondary-button" disabled={!minutes && !keyPoints} onClick={downloadNotesMarkdown}>
               Download Notes MD
             </button>
+            <button className="secondary-button" disabled={!result.subtitles?.hi} onClick={() => downloadSubtitle("hi")}>
+              Download Hindi SRT
+            </button>
+            <button className="secondary-button" disabled={!result.subtitles?.en} onClick={() => downloadSubtitle("en")}>
+              Download English SRT
+            </button>
             <button className="secondary-button" disabled={!hasTranscript} onClick={downloadReportJson}>
               Export Report JSON
             </button>
@@ -789,21 +1047,87 @@ function App() {
           {selectedTab === "transcript" && (
             <div className="tab-panel">
               <div className="transcript-grid">
-                <TextPanel label="Raw Whisper Transcript" value={result.rawTranscript} />
-                <TextPanel label="Speaker-Labeled Transcript" value={renamedSpeakerTranscript} />
+                <TextPanel
+                  label={result.originalLanguage === "hi" ? "Raw Hindi Transcript" : "Raw Whisper Transcript"}
+                  value={result.rawTranscript}
+                />
+                <TextPanel label="Normalized Transcript" value={result.normalizedTranscript} />
+              </div>
+
+              <div className="review-grid review-grid-three">
+                <div className="info-panel">
+                  <strong>Mixed Language Detector</strong>
+                  <p>{result.isMixed ? "Mixed Language Detected" : "Single-language transcript detected."}</p>
+                  <p>Normalization mode: {getNormalizationLabel(result.normalizationMode || normalizationMode)}</p>
+                </div>
+                <div className="info-panel">
+                  <strong>Normalization Hint</strong>
+                  <p>
+                    {result.isMixed
+                      ? "Segments were normalized before correction so Hindi-English switches stay consistent during cleanup."
+                      : "No mandatory code-switch normalization was needed for this transcript."}
+                  </p>
+                </div>
+                <div className="info-panel">
+                  <strong>Speaker-Labeled Transcript</strong>
+                  <p>
+                    {renamedSpeakerTranscript
+                      ? "Speaker diarization is available below in the dedicated speaker transcript and timeline."
+                      : "Speaker transcript unavailable."}
+                  </p>
+                </div>
+              </div>
+
+              <div className="status-card">
+                <strong>Dual Transcript View</strong>
+                <p>
+                  The system keeps correction in the original language first, then exposes multilingual views after
+                  validation-ready cleanup.
+                </p>
+              </div>
+
+              <div className="dual-language-toolbar">
+                <strong>Transcript toggle</strong>
+                <div className="language-toggle">
+                  {availableTranscriptOptions.map((option) => (
+                    <button
+                      key={option.code}
+                      type="button"
+                      className={selectedLanguage === option.code ? "language-pill active" : "language-pill"}
+                      onClick={() => setSelectedLanguage(option.code)}
+                    >
+                      {option.label}
+                    </button>
+                  ))}
+                </div>
+              </div>
+
+              <div className="transcript-grid">
+                <TextPanel label="Corrected Hindi Transcript" value={speakerAwareCorrectedHindiTranscript} tall />
+                <TextPanel label="English Translation" value={speakerAwareEnglishTranslation} tall />
               </div>
 
               <TextPanel
-                label="Final Corrected Transcript"
-                value={result.correctedTranscript}
+                label={`Selected ${getLanguageLabel(selectedLanguage, TRANSLATION_OPTIONS)} Clean View`}
+                value={speakerAwareSelectedTranscript}
                 tall
-                readOnly={false}
+                readOnly={selectedLanguage !== (result.originalLanguage || "en")}
                 onChange={(value) =>
                   setResult((current) => ({
                     ...current,
-                    correctedTranscript: value,
+                    correctedTranscript: transcriptLines(value).join("\n"),
+                    transcripts: {
+                      ...current.transcripts,
+                      [toTranscriptKey(current.originalLanguage || "en")]: transcriptLines(value).join("\n"),
+                    },
                   }))
                 }
+              />
+
+              <TextPanel
+                label="Speaker-Labeled Transcript"
+                value={renamedSpeakerTranscript}
+                tall
               />
 
               <div className="review-grid review-grid-three">
@@ -841,7 +1165,11 @@ function App() {
 
                 <div className="info-panel">
                   <strong>Pipeline Meta</strong>
-                  <p>Language: {getLanguageLabel(transcriptionLanguage, LANGUAGE_OPTIONS)}</p>
+                  <p>Detected: {getLanguageLabel(result.detectedLanguage, LANGUAGE_OPTIONS)}</p>
+                  <p>Pipeline Source: {getLanguageLabel(result.originalLanguage, LANGUAGE_OPTIONS)}</p>
+                  <p>Requested: {getLanguageLabel(transcriptionLanguage, LANGUAGE_OPTIONS)}</p>
+                  <p>Mixed: {result.isMixed ? "Yes" : "No"}</p>
+                  <p>Normalization: {getNormalizationLabel(result.normalizationMode || normalizationMode)}</p>
                   <p>Domain: {getDomainLabel(domainMode)}</p>
                   <p>Summary style: {getSummaryStyleLabel(summaryStyle)}</p>
                 </div>
@@ -907,8 +1235,8 @@ function App() {
               </div>
               <div className="notes-grid notes-grid-three">
                 <TextPanel label="Raw Transcript" value={result.rawTranscript} tall />
-                <TextPanel label="Speaker Transcript" value={renamedSpeakerTranscript} tall />
-                <TextPanel label="Final Transcript" value={result.correctedTranscript} tall />
+                <TextPanel label="Normalized Transcript" value={result.normalizedTranscript} tall />
+                <TextPanel label="Corrected Transcript" value={result.correctedTranscript} tall />
               </div>
               <TextPanel label="Timestamped Transcript" value={renamedTimestampedTranscript} tall />
             </div>
@@ -937,7 +1265,7 @@ function App() {
                 <p>{translationStatus}</p>
               </div>
               <label className="field">
-                <span>Translation language</span>
+                <span>Transcript / voice language</span>
                 <select value={selectedLanguage} onChange={(event) => setSelectedLanguage(event.target.value)}>
                   {TRANSLATION_OPTIONS.map((option) => (
                     <option key={option.code} value={option.code}>
@@ -966,19 +1294,176 @@ function App() {
                 <AudioCard label="English Audio" src={englishAudioUrl} />
                 <AudioCard label={`${getLanguageLabel(selectedLanguage, TRANSLATION_OPTIONS)} Audio`} src={targetAudioUrl} />
               </div>
-              <TextPanel label={`${getLanguageLabel(selectedLanguage, TRANSLATION_OPTIONS)} Translation`} value={translatedText} tall />
+              <div className="notes-grid">
+                <TextPanel label={`${getLanguageLabel(selectedLanguage, TRANSLATION_OPTIONS)} Transcript`} value={translatedText} tall />
+                <TextPanel label="English Subtitle (.srt)" value={result.subtitles?.en || ""} tall />
+              </div>
+              <TextPanel label="Hindi Subtitle (.srt)" value={result.subtitles?.hi || ""} tall />
             </div>
           )}
 
           {selectedTab === "notes" && (
             <div className="tab-panel">
+              {/* Sentiment & Overview Row */}
               <div className="notes-grid notes-grid-three">
-                <RichTextPanel label="Minutes of Meeting" value={minutes} tall />
-                <RichTextPanel label="Key Points" value={keyPoints} tall />
-                <RichTextPanel label="Decisions" value={decisions} tall />
+                <div className="sentiment-card">
+                  <div className="panel-label">Meeting Sentiment</div>
+                  {hasMeetingAnalysis ? (
+                    <div className="sentiment-display">
+                      <span className={`sentiment-badge sentiment-${sentiment}`}>
+                        {sentiment.charAt(0).toUpperCase() + sentiment.slice(1)}
+                      </span>
+                      <div className="sentiment-score">
+                        <div className="progress-track small">
+                          <div 
+                            className={`progress-fill sentiment-${sentiment}`} 
+                            style={{ width: `${sentimentScore}%` }} 
+                          />
+                        </div>
+                        <small>{sentimentScore}%</small>
+                      </div>
+                    </div>
+                  ) : (
+                    <p className="rich-placeholder">Sentiment appears after meeting analysis is generated.</p>
+                  )}
+                </div>
+                <div className="overview-card">
+                  <div className="panel-label">Meeting Overview</div>
+                  {meetingTopic ? (
+                    <p className="overview-topic"><strong>Topic:</strong> {meetingTopic}</p>
+                  ) : null}
+                  {agenda ? (
+                    <p className="overview-agenda"><strong>Agenda:</strong> {agenda}</p>
+                  ) : null}
+                  {nextMeeting ? (
+                    <p className="overview-next"><strong>Next Meeting:</strong> {nextMeeting}</p>
+                  ) : null}
+                  {!meetingTopic && !agenda && !nextMeeting && (
+                    <p className="rich-placeholder">Generate notes to see overview.</p>
+                  )}
+                </div>
+                <div className="attendees-card">
+                  <div className="panel-label">Attendees</div>
+                  {attendees.length > 0 ? (
+                    <div className="attendees-list">
+                      {attendees.map((attendee, idx) => (
+                        <span key={idx} className="attendee-tag">{attendee}</span>
+                      ))}
+                    </div>
+                  ) : (
+                    <p className="rich-placeholder">No attendees detected.</p>
+                  )}
+                </div>
               </div>
+
+              {/* Key Sections Row */}
+              <div className="notes-grid notes-grid-three">
+                <RichTextPanel label="Corrected Source Transcript" value={result.correctedTranscript} tall />
+                <RichTextPanel label="Minutes of Meeting" value={minutes} tall />
+                <RichTextPanel label="English Minutes of Meeting" value={englishMinutes} tall />
+              </div>
+
+              <div className="notes-grid notes-grid-three">
+                <RichTextPanel label="Key Takeaways" value={keyTakeaways || keyPoints} tall />
+                <RichTextPanel label="Corrected Hindi Transcript" value={correctedHindiTranscript} tall />
+                <RichTextPanel label="English Translation" value={englishTranslation} tall />
+              </div>
+
               <div className="notes-grid">
-                <RichTextPanel label="Action Items" value={actionItems} tall />
+                <RichTextPanel label="Discussion Topics" value={discussionTopics} tall />
+              </div>
+
+              {/* Decisions & Action Items Row */}
+              <div className="notes-grid notes-grid-two">
+                <div className="parsed-section">
+                  <div className="panel-label">Decisions</div>
+                  {parsedDecisions.length > 0 ? (
+                    <div className="parsed-list">
+                      {parsedDecisions.map((dec, idx) => (
+                        <div key={idx} className={`parsed-item decision-item ${dec.approved ? 'approved' : ''}`}>
+                          <span className="parsed-icon">{dec.approved ? '✓' : '○'}</span>
+                          <span className="parsed-text">{dec.decision}</span>
+                          {dec.participants.length > 0 && (
+                            <span className="parsed-meta">[{dec.participants.join(', ')}]</span>
+                          )}
+                        </div>
+                      ))}
+                    </div>
+                  ) : (
+                    <RichTextPanel label="" value={decisions} />
+                  )}
+                </div>
+                <div className="parsed-section">
+                  <div className="panel-label">Action Items</div>
+                  {parsedActionItems.length > 0 ? (
+                    <div className="parsed-list">
+                      {parsedActionItems.map((item, idx) => (
+                        <div key={idx} className={`parsed-item action-item priority-${item.priority.toLowerCase()}`}>
+                          <div className="action-header">
+                            <span className={`priority-badge priority-${item.priority.toLowerCase()}`}>
+                              {item.priority}
+                            </span>
+                            <span className="action-owner">{item.owner}</span>
+                          </div>
+                          <span className="parsed-text">{item.action}</span>
+                          <span className="parsed-meta">Due: {item.due_date}</span>
+                        </div>
+                      ))}
+                    </div>
+                  ) : (
+                    <RichTextPanel label="" value={actionItems} />
+                  )}
+                </div>
+              </div>
+
+              {/* Q&A and Resources Row */}
+              <div className="notes-grid notes-grid-two">
+                <div className="qa-section">
+                  <div className="panel-label">Q&A</div>
+                  {qaPairs.length > 0 ? (
+                    <div className="qa-list">
+                      {qaPairs.map((qa, idx) => (
+                        <div key={idx} className="qa-item">
+                          <p className="qa-question"><strong>Q:</strong> {qa.question}</p>
+                          <p className="qa-answer"><strong>A:</strong> {qa.answer}</p>
+                        </div>
+                      ))}
+                    </div>
+                  ) : (
+                    <p className="rich-placeholder">No Q&A pairs detected.</p>
+                  )}
+                </div>
+                <div className="resources-section">
+                  <div className="panel-label">Resources</div>
+                  {resources.length > 0 ? (
+                    <div className="resources-list">
+                      {resources.map((res, idx) => (
+                        <div key={idx} className="resource-item">
+                          <span className={`resource-type ${res.type}`}>{res.type}</span>
+                          <span className="resource-name">{res.name}</span>
+                        </div>
+                      ))}
+                    </div>
+                  ) : (
+                    <p className="rich-placeholder">No resources mentioned.</p>
+                  )}
+                </div>
+              </div>
+
+              {/* Dates Mentioned */}
+              {datesMentioned.length > 0 && (
+                <div className="dates-row">
+                  <div className="panel-label">Dates Mentioned</div>
+                  <div className="dates-list">
+                    {datesMentioned.map((date, idx) => (
+                      <span key={idx} className="date-tag">{date}</span>
+                    ))}
+                  </div>
+                </div>
+              )}
+
+              {/* Important Moments (Legacy) */}
+              <div className="notes-grid">
                 <article className="text-panel rich-text-panel tall">
                   <div className="panel-label">Important Moments</div>
                   <div className="rich-text-content">
@@ -1084,6 +1569,43 @@ function normalizeValidation(validation) {
   };
 }
 
+function normalizeTranscripts(transcripts, correctedTranscript, originalLanguage) {
+  const sourceCode = (originalLanguage || "en").toLowerCase();
+  const sourceKey = toTranscriptKey(sourceCode);
+  const normalized = {
+    hindi: "",
+    english: "",
+    tamil: "",
+    telugu: "",
+    ...(transcripts || {}),
+  };
+
+  if (correctedTranscript && sourceKey in normalized && !normalized[sourceKey]) {
+    normalized[sourceKey] = correctedTranscript;
+  }
+
+  return normalized;
+}
+
+function toTranscriptKey(code) {
+  switch ((code || "").toLowerCase()) {
+    case "hi":
+      return "hindi";
+    case "en":
+      return "english";
+    case "ta":
+      return "tamil";
+    case "te":
+      return "telugu";
+    default:
+      return "english";
+  }
+}
+
+function getTranscriptByCode(transcripts, code) {
+  return String((transcripts || {})[toTranscriptKey(code)] || "");
+}
+
 function SegmentTimeline({ segments, speakerAliases, searchQuery }) {
   return (
     <article className="timeline-card">
@@ -1146,6 +1668,55 @@ function formatClock(value) {
   return `${minutes}:${seconds}`;
 }
 
+function stripSpeakerLabel(line) {
+  return String(line || "").replace(/^\s*Person\s+\d+\s*:\s*/i, "").trim();
+}
+
+function transcriptLines(text) {
+  const rawLines = String(text || "")
+    .split("\n")
+    .map((line) => stripSpeakerLabel(line))
+    .filter((line) => line.trim());
+
+  if (rawLines.length > 0) return rawLines;
+
+  return String(text || "")
+    .split(/(?<=[.!?।])\s+/)
+    .map((line) => stripSpeakerLabel(line))
+    .filter((line) => line.trim());
+}
+
+function partitionTranscriptLines(lines, slotCount) {
+  if (slotCount <= 0) return [];
+  if (!lines.length) return Array.from({ length: slotCount }, () => "");
+  if (lines.length >= slotCount) return lines.slice(0, slotCount);
+
+  const remaining = [...lines];
+  const output = [];
+  for (let index = 0; index < slotCount; index += 1) {
+    const remainingSlots = slotCount - index;
+    const take = Math.max(1, Math.round(remaining.length / remainingSlots));
+    output.push(remaining.splice(0, take).join(" ").trim());
+  }
+  return output;
+}
+
+function buildSpeakerAwareTranscript(transcript, segments, aliases) {
+  const cleanSegments = (segments || []).filter((segment) => String(segment.text || "").trim());
+  const text = String(transcript || "").trim();
+  if (!text) return "";
+  if (!cleanSegments.length) return text;
+
+  const lines = partitionTranscriptLines(transcriptLines(text), cleanSegments.length);
+  return cleanSegments
+    .map((segment, index) => {
+      const label = aliases?.[segment.speaker] || `Person ${segment.speaker}`;
+      const content = String(lines[index] || "").trim() || String(segment.text || "").trim();
+      return `${label}: ${content}`;
+    })
+    .join("\n");
+}
+
 function countWords(text) {
   return String(text || "")
     .trim()
@@ -1173,6 +1744,10 @@ function getDomainLabel(code) {
 
 function getSummaryStyleLabel(code) {
   return SUMMARY_STYLES.find((option) => option.code === code)?.label || code;
+}
+
+function getNormalizationLabel(code) {
+  return NORMALIZATION_OPTIONS.find((option) => option.code === code)?.label || code;
 }
 
 function escapeRegExp(value) {
